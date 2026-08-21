@@ -16,6 +16,11 @@ VOCAB_SIZE=3919
 RESULTS_DIR="results"
 FORCE_RETRAIN=${FORCE_RETRAIN:-0}
 
+SKIP_TRANSFORMER=${SKIP_TRANSFORMER:-0}
+SKIP_HRM=${SKIP_HRM:-0}
+SKIP_MAMBA=${SKIP_MAMBA:-0}
+SKIP_HYBRID=${SKIP_HYBRID:-0}
+
 echo "============================================================"
 echo "  Amharic LM Architecture Comparison"
 echo "  Architectures: Transformer, HRM, Mamba, Hybrid"
@@ -59,7 +64,9 @@ echo ""
 echo "============================================================"
 echo "[1/6] Training: TRANSFORMER (Qwen3.5 DeltaNet + Gated Attention + MTP)"
 echo "============================================================"
-if has_checkpoint "transformer"; then
+if [ "$SKIP_TRANSFORMER" = "1" ]; then
+    echo "  ⏭ Skipping Transformer per user request."
+elif has_checkpoint "transformer"; then
     echo "  ✓ Transformer already trained! Skipping to next architecture."
 else
     python train.py \
@@ -82,7 +89,9 @@ echo ""
 echo "============================================================"
 echo "[2/6] Training: HRM-Text (Hierarchical Reasoning Model)"
 echo "============================================================"
-if has_checkpoint "hrm"; then
+if [ "$SKIP_HRM" = "1" ]; then
+    echo "  ⏭ Skipping HRM per user request."
+elif has_checkpoint "hrm"; then
     echo "  ✓ HRM already trained! Skipping to next architecture."
 else
     python train.py \
@@ -105,7 +114,9 @@ echo ""
 echo "============================================================"
 echo "[3/6] Training: MAMBA (Selective State Space Model)"
 echo "============================================================"
-if has_checkpoint "mamba"; then
+if [ "$SKIP_MAMBA" = "1" ]; then
+    echo "  ⏭ Skipping Mamba per user request."
+elif has_checkpoint "mamba"; then
     echo "  ✓ Mamba already trained! Skipping to next architecture."
 else
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -130,7 +141,9 @@ echo ""
 echo "============================================================"
 echo "[4/6] Training: HYBRID (Mamba SSM + Qwen3.5 Attention)"
 echo "============================================================"
-if has_checkpoint "hybrid"; then
+if [ "$SKIP_HYBRID" = "1" ]; then
+    echo "  ⏭ Skipping Hybrid per user request."
+elif has_checkpoint "hybrid"; then
     echo "  ✓ Hybrid already trained! Skipping to next architecture."
 else
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -160,7 +173,7 @@ for ARCH in transformer hrm mamba hybrid; do
     echo ""
     echo "--- Benchmarking ${ARCH} ---"
     
-    # Locate best checkpoint
+    # Locate best checkpoint if available
     CKPT_PATH="$RESULTS_DIR/$ARCH/best_model.pt"
     if [ ! -f "$CKPT_PATH" ]; then
         for d in "$RESULTS_DIR"/${ARCH}_*; do
@@ -171,12 +184,20 @@ for ARCH in transformer hrm mamba hybrid; do
         done
     fi
 
-    python benchmark.py \
-        --arch $ARCH \
-        --vocab-size $VOCAB_SIZE \
-        --checkpoint "$CKPT_PATH" \
-        --output-dir $RESULTS_DIR \
-        --seq-lengths 128 256 512 1024 2048
+    if [ -f "$CKPT_PATH" ]; then
+        python benchmark.py \
+            --arch $ARCH \
+            --vocab-size $VOCAB_SIZE \
+            --checkpoint "$CKPT_PATH" \
+            --output-dir $RESULTS_DIR \
+            --seq-lengths 128 256 512 1024 2048
+    else
+        python benchmark.py \
+            --arch $ARCH \
+            --vocab-size $VOCAB_SIZE \
+            --output-dir $RESULTS_DIR \
+            --seq-lengths 128 256 512 1024 2048
+    fi
 done
 
 # ============================================================
