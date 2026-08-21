@@ -14,6 +14,7 @@ LR=${LR:-3e-4}
 WARMUP_STEPS=${WARMUP_STEPS:-50}
 VOCAB_SIZE=3919
 RESULTS_DIR="results"
+FORCE_RETRAIN=${FORCE_RETRAIN:-0}
 
 echo "============================================================"
 echo "  Amharic LM Architecture Comparison"
@@ -23,6 +24,24 @@ echo "  Target: ~50M parameters each"
 echo "  Epochs: ${EPOCHS} | Batch Size: ${BATCH_SIZE} | Seq Len: ${SEQ_LEN}"
 echo "  $(date)"
 echo "============================================================"
+
+# Helper to check if model already has a checkpoint
+has_checkpoint() {
+    local arch=$1
+    if [ "$FORCE_RETRAIN" = "1" ]; then
+        return 1
+    fi
+    if [ -f "$RESULTS_DIR/$arch/best_model.pt" ]; then
+        return 0
+    fi
+    # Check timestamped directories
+    for d in "$RESULTS_DIR"/${arch}_*; do
+        if [ -d "$d" ] && [ -f "$d/best_model.pt" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 # ============================================================
 # Step 0: Setup (if not already done)
@@ -40,17 +59,21 @@ echo ""
 echo "============================================================"
 echo "[1/6] Training: TRANSFORMER (Qwen3.5 DeltaNet + Gated Attention + MTP)"
 echo "============================================================"
-python train.py \
-    --arch transformer \
-    --vocab-size $VOCAB_SIZE \
-    --data-dir data/tokenized \
-    --output-dir $RESULTS_DIR \
-    --epochs $EPOCHS \
-    --batch-size $BATCH_SIZE \
-    --grad-accum 1 \
-    --warmup-steps $WARMUP_STEPS \
-    --seq-len $SEQ_LEN \
-    --lr $LR
+if has_checkpoint "transformer"; then
+    echo "  ✓ Transformer already trained! Skipping to next architecture."
+else
+    python train.py \
+        --arch transformer \
+        --vocab-size $VOCAB_SIZE \
+        --data-dir data/tokenized \
+        --output-dir $RESULTS_DIR \
+        --epochs $EPOCHS \
+        --batch-size $BATCH_SIZE \
+        --grad-accum 1 \
+        --warmup-steps $WARMUP_STEPS \
+        --seq-len $SEQ_LEN \
+        --lr $LR
+fi
 
 # ============================================================
 # Step 2: Train HRM-Text (Dual-timescale Recurrence)
@@ -59,17 +82,21 @@ echo ""
 echo "============================================================"
 echo "[2/6] Training: HRM-Text (Hierarchical Reasoning Model)"
 echo "============================================================"
-python train.py \
-    --arch hrm \
-    --vocab-size $VOCAB_SIZE \
-    --data-dir data/tokenized \
-    --output-dir $RESULTS_DIR \
-    --epochs $EPOCHS \
-    --batch-size 32 \
-    --grad-accum 2 \
-    --warmup-steps $WARMUP_STEPS \
-    --seq-len $SEQ_LEN \
-    --lr $LR
+if has_checkpoint "hrm"; then
+    echo "  ✓ HRM already trained! Skipping to next architecture."
+else
+    python train.py \
+        --arch hrm \
+        --vocab-size $VOCAB_SIZE \
+        --data-dir data/tokenized \
+        --output-dir $RESULTS_DIR \
+        --epochs $EPOCHS \
+        --batch-size 32 \
+        --grad-accum 2 \
+        --warmup-steps $WARMUP_STEPS \
+        --seq-len $SEQ_LEN \
+        --lr $LR
+fi
 
 # ============================================================
 # Step 3: Train Mamba (Selective SSM)
@@ -78,18 +105,22 @@ echo ""
 echo "============================================================"
 echo "[3/6] Training: MAMBA (Selective State Space Model)"
 echo "============================================================"
-python train.py \
-    --arch mamba \
-    --vocab-size $VOCAB_SIZE \
-    --data-dir data/tokenized \
-    --output-dir $RESULTS_DIR \
-    --epochs $EPOCHS \
-    --batch-size $BATCH_SIZE \
-    --grad-accum 1 \
-    --warmup-steps $WARMUP_STEPS \
-    --seq-len $SEQ_LEN \
-    --lr $LR \
-    --mamba-backend auto
+if has_checkpoint "mamba"; then
+    echo "  ✓ Mamba already trained! Skipping to next architecture."
+else
+    python train.py \
+        --arch mamba \
+        --vocab-size $VOCAB_SIZE \
+        --data-dir data/tokenized \
+        --output-dir $RESULTS_DIR \
+        --epochs $EPOCHS \
+        --batch-size $BATCH_SIZE \
+        --grad-accum 1 \
+        --warmup-steps $WARMUP_STEPS \
+        --seq-len $SEQ_LEN \
+        --lr $LR \
+        --mamba-backend auto
+fi
 
 # ============================================================
 # Step 4: Train Hybrid (Mamba + Qwen3.5 Attention)
@@ -98,18 +129,22 @@ echo ""
 echo "============================================================"
 echo "[4/6] Training: HYBRID (Mamba SSM + Qwen3.5 Attention)"
 echo "============================================================"
-python train.py \
-    --arch hybrid \
-    --vocab-size $VOCAB_SIZE \
-    --data-dir data/tokenized \
-    --output-dir $RESULTS_DIR \
-    --epochs $EPOCHS \
-    --batch-size $BATCH_SIZE \
-    --grad-accum 1 \
-    --warmup-steps $WARMUP_STEPS \
-    --seq-len $SEQ_LEN \
-    --lr $LR \
-    --mamba-backend auto
+if has_checkpoint "hybrid"; then
+    echo "  ✓ Hybrid already trained! Skipping to next architecture."
+else
+    python train.py \
+        --arch hybrid \
+        --vocab-size $VOCAB_SIZE \
+        --data-dir data/tokenized \
+        --output-dir $RESULTS_DIR \
+        --epochs $EPOCHS \
+        --batch-size $BATCH_SIZE \
+        --grad-accum 1 \
+        --warmup-steps $WARMUP_STEPS \
+        --seq-len $SEQ_LEN \
+        --lr $LR \
+        --mamba-backend auto
+fi
 
 # ============================================================
 # Step 5: Benchmark all models
@@ -122,10 +157,22 @@ echo "============================================================"
 for ARCH in transformer hrm mamba hybrid; do
     echo ""
     echo "--- Benchmarking ${ARCH} ---"
+    
+    # Locate best checkpoint
+    CKPT_PATH="$RESULTS_DIR/$ARCH/best_model.pt"
+    if [ ! -f "$CKPT_PATH" ]; then
+        for d in "$RESULTS_DIR"/${ARCH}_*; do
+            if [ -d "$d" ] && [ -f "$d/best_model.pt" ]; then
+                CKPT_PATH="$d/best_model.pt"
+                break
+            fi
+        done
+    fi
+
     python benchmark.py \
         --arch $ARCH \
         --vocab-size $VOCAB_SIZE \
-        --checkpoint $RESULTS_DIR/$ARCH/best_model.pt \
+        --checkpoint "$CKPT_PATH" \
         --output-dir $RESULTS_DIR \
         --seq-lengths 128 256 512 1024 2048
 done

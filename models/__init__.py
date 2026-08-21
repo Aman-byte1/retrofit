@@ -12,11 +12,20 @@ MODEL_REGISTRY = {
     "hybrid": create_hybrid,
 }
 
-def create_model(arch: str, vocab_size: int, target_params: int = 50_000_000):
-    """Create a model by architecture name."""
+def create_model(arch: str, vocab_size: int = 3919, target_params: int = 50_000_000, **kwargs):
+    """Create a model by architecture name with optional kwargs forwarding."""
     if arch not in MODEL_REGISTRY:
         raise ValueError(f"Unknown architecture: {arch}. Choose from {list(MODEL_REGISTRY.keys())}")
-    return MODEL_REGISTRY[arch](vocab_size, target_params)
+    
+    fn = MODEL_REGISTRY[arch]
+    if arch == "mamba":
+        backend = kwargs.get("mamba_backend", kwargs.get("backend", "auto"))
+        return fn(vocab_size=vocab_size, target_params=target_params, backend=backend)
+    elif arch == "hybrid":
+        backend = kwargs.get("mamba_backend", kwargs.get("backend", "auto"))
+        return fn(vocab_size=vocab_size, target_params=target_params, mamba_backend=backend)
+    else:
+        return fn(vocab_size=vocab_size, target_params=target_params)
 
 __all__ = [
     "TransformerLM", "HRMLM", "MambaLM", "HybridMambaTransformerLM",

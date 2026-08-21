@@ -377,9 +377,10 @@ def choose_near_target_mamba_config(vocab_size: int, target_params: int = 50_000
     return min(candidates, key=lambda x: x[0])[2]
 
 
-def create_mamba(vocab_size: int = 3919, target_params: int = 50_000_000, backend: str = "auto") -> MambaLM:
+def create_mamba(vocab_size: int = 3919, target_params: int = 50_000_000, backend: str = "auto", mamba_backend: Optional[str] = None) -> MambaLM:
     """Create a Mamba LM targeting ~50M parameters."""
     cfg = choose_near_target_mamba_config(vocab_size, target_params)
+    effective_backend = mamba_backend or backend
     return MambaLM(
         vocab_size=vocab_size,
         d_model=cfg["d_model"],
@@ -387,5 +388,5 @@ def create_mamba(vocab_size: int = 3919, target_params: int = 50_000_000, backen
         d_state=16,
         d_conv=4,
         expand=2,
-        backend=backend,
+        backend=effective_backend,
     )
