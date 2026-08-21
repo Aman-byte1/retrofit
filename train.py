@@ -105,8 +105,16 @@ def train_one_epoch(
     
     epoch_start = time.time()
     
+    total_steps = getattr(model, "_total_training_steps", len(dataloader))
+    
     for step, (x, y) in enumerate(dataloader):
         step_start = time.time()
+        global_step = epoch * len(dataloader) + step
+        
+        # Calculate TBPTT horizon for HRM models if supported
+        kwargs = {}
+        if hasattr(model, "backward_horizon"):
+            kwargs["bp_steps"] = model.backward_horizon(global_step, total_steps)
         
         x = x.to(device)
         y = y.to(device)
@@ -117,14 +125,14 @@ def train_one_epoch(
         # Mixed precision training
         if scaler is not None:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                logits, loss = model(x, targets=y)
+                logits, loss = model(x, targets=y, **kwargs)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits, loss = model(x, targets=y)
+            logits, loss = model(x, targets=y, **kwargs)
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
@@ -278,6 +286,7 @@ def train_model(
     
     # Cosine schedule with warmup
     total_steps = epochs * len(train_dl)
+    model._total_training_steps = total_steps
     
     def lr_lambda(step):
         if step < warmup_steps:
