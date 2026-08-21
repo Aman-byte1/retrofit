@@ -271,9 +271,16 @@ def train_model(
     logger.info(f"Train: {len(train_ds)} sequences ({len(train_ds) * seq_len:,} tokens)")
     logger.info(f"Val:   {len(val_ds)} sequences ({len(val_ds) * seq_len:,} tokens)")
     
-    # Optimizer with parameter grouping (weight decay only on 2D+ tensors, 0.0 on norms & biases)
-    decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+    # Optimizer with parameter grouping (weight decay only on 2D+ tensors, 0.0 on norms, biases, and _no_weight_decay)
+    decay_params = []
+    nodecay_params = []
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        if getattr(p, "_no_weight_decay", False) or p.dim() < 2:
+            nodecay_params.append(p)
+        else:
+            decay_params.append(p)
     optim_groups = [
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": nodecay_params, "weight_decay": 0.0},

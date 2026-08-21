@@ -1,202 +1,325 @@
 """
 Mamba (Selective State Space Model) Language Model (~50M params).
 
-Implementation based on:
+Implementation aligned with official Mamba:
   "Mamba: Linear-Time Sequence Modeling with Selective State Spaces" (Gu & Dao, 2023)
   https://github.com/state-spaces/mamba
 
-Uses the official `mamba_ssm` package for the core SSM block.
-Falls back to a pure-PyTorch implementation if mamba_ssm is not available.
-Equipped with QwenRMSNorm for layer normalization.
+Features:
+  • Official `mamba_ssm` backend with high-performance CUDA fused selective scan
+  • Mathematically faithful pure-PyTorch fallback with exact dt_rank = ceil(d_model / 16)
+  • Specialized Mamba initialization (dt_proj log-spaced inverse softplus, S4D A_log)
+  • Protection of A_log and D parameters from weight decay (_no_weight_decay = True)
+  • Self-contained RMSNorm (eps=1e-5)
+  • Dynamic near-target configuration search (~50M parameters across any vocab)
 """
 
 import math
+from typing import Optional, Dict, Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
-from .transformer_lm import QwenRMSNorm
+
+IGNORE_INDEX = -100
+
+
+class RMSNorm(nn.Module):
+    """Self-contained Root Mean Square Layer Normalization (standard Mamba norm)."""
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps)
+        return (normalized * self.weight.float()).to(x.dtype)
 
 
 class MambaBlock(nn.Module):
     """
     Mamba Selective SSM block.
     
-    Tries to use the official `mamba_ssm.Mamba` implementation.
-    Falls back to a pure-PyTorch selective SSM if not available.
+    Supports:
+      - Official `mamba_ssm.Mamba` kernel when available.
+      - Exact PyTorch fallback with full dt_rank = ceil(d_model / 16) and official initialization.
     """
-    
-    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: Optional[int] = None,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init_floor: float = 1e-4,
+        backend: str = "auto",
+    ):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
+        self.expand = expand
         self.d_inner = d_model * expand
-        
+        self.dt_rank = dt_rank or math.ceil(d_model / 16)
+        self.backend = backend
+
         self._use_official = False
-        
-        try:
-            from mamba_ssm import Mamba
-            self.mamba = Mamba(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
-            )
-            self._use_official = True
-        except ImportError:
-            self._build_fallback()
-    
-    def _build_fallback(self):
-        """Build pure-PyTorch selective SSM."""
+
+        if backend in {"auto", "official"}:
+            try:
+                from mamba_ssm import Mamba
+                self.mamba = Mamba(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand,
+                    dt_rank=self.dt_rank,
+                )
+                self._use_official = True
+            except ImportError as exc:
+                if backend == "official":
+                    raise ImportError("Install `mamba-ssm` or use backend='auto'/'torch'") from exc
+                self._build_fallback(dt_min, dt_max, dt_init_floor)
+        else:
+            self._build_fallback(dt_min, dt_max, dt_init_floor)
+
+    def _build_fallback(self, dt_min: float, dt_max: float, dt_init_floor: float):
+        """Build exact pure-PyTorch selective SSM with official Mamba parameterization."""
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False)
-        
+
+        # Depthwise 1D causal convolution
         self.conv1d = nn.Conv1d(
-            self.d_inner, self.d_inner,
+            self.d_inner,
+            self.d_inner,
             kernel_size=self.d_conv,
             padding=self.d_conv - 1,
             groups=self.d_inner,
             bias=True,
         )
-        
-        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2 + 1, bias=False)
-        self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
-        
-        A = torch.arange(1, self.d_state + 1, dtype=torch.float32)
-        self.A_log = nn.Parameter(torch.log(A.repeat(self.d_inner, 1)))
+
+        # Selective projection: projects to (dt_rank + 2 * d_state)
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * self.d_state, bias=False)
+
+        # Time-step delta projection: dt_rank -> d_inner
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+        # Specialized dt_proj initialization
+        dt_init_std = self.dt_rank ** -0.5
+        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+
+        # Initialize dt_proj.bias to inverse softplus of log-uniform sampled values
+        dt = torch.exp(
+            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+
+        # S4D diagonal state matrix A (log-parameterized: A = -exp(A_log))
+        A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+
+        # Skip parameter D
         self.D = nn.Parameter(torch.ones(self.d_inner))
+        self.D._no_weight_decay = True
+
+        # Output projection
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
-    
-    def _ssm_scan(self, x: torch.Tensor) -> torch.Tensor:
+
+    def _ssm_scan(self, x: torch.Tensor, dt: torch.Tensor, B_ssm: torch.Tensor, C_ssm: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable sequential selective scan in pure PyTorch.
+        x: [B, L, d_inner]
+        dt: [B, L, d_inner]
+        B_ssm: [B, L, d_state]
+        C_ssm: [B, L, d_state]
+        """
         B, L, D = x.shape
-        x_proj = self.x_proj(x)
-        B_ssm = x_proj[..., :self.d_state]
-        C_ssm = x_proj[..., self.d_state:2*self.d_state]
-        dt = F.softplus(self.dt_proj(x_proj[..., -1:]))
-        
-        A = -torch.exp(self.A_log)
-        h = torch.zeros(B, D, self.d_state, device=x.device, dtype=x.dtype)
+        A = -torch.exp(self.A_log.float())  # [d_inner, d_state]
+
+        h = torch.zeros(B, D, self.d_state, device=x.device, dtype=torch.float32)
         ys = []
-        
+
         for t in range(L):
-            dt_t = dt[:, t]
-            B_t = B_ssm[:, t]
-            C_t = C_ssm[:, t]
-            x_t = x[:, t]
-            
-            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
-            dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)
-            
+            dt_t = dt[:, t].float()    # [B, d_inner]
+            B_t = B_ssm[:, t].float()  # [B, d_state]
+            C_t = C_ssm[:, t].float()  # [B, d_state]
+            x_t = x[:, t].float()      # [B, d_inner]
+
+            # Discretize continuous matrices A and B using zero-order hold (ZOH)
+            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))     # [B, d_inner, d_state]
+            dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)              # [B, d_inner, d_state]
+
+            # Recurrent state update: h = dA * h + dB * x
             h = dA * h + dB * x_t.unsqueeze(-1)
-            y = (C_t.unsqueeze(1) * h).sum(-1)
-            y = y + self.D * x_t
-            ys.append(y)
-        
+
+            # Output computation: y = C * h + D * x
+            y = (C_t.unsqueeze(1) * h).sum(-1) + self.D.float() * x_t  # [B, d_inner]
+            ys.append(y.to(x.dtype))
+
         return torch.stack(ys, dim=1)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._use_official:
             return self.mamba(x)
-        
-        B, L, D = x.shape
+
+        B, L, _ = x.shape
+
+        # 1. Dual projection (x_inner and gate z)
         xz = self.in_proj(x)
         x_inner, z = xz.chunk(2, dim=-1)
-        
+
+        # 2. Causal depthwise 1D conv
         x_inner = x_inner.transpose(1, 2)
         x_inner = self.conv1d(x_inner)[:, :, :L]
-        x_inner = x_inner.transpose(1, 2)
-        x_inner = F.silu(x_inner)
-        
-        y = self._ssm_scan(x_inner)
+        x_inner = F.silu(x_inner.transpose(1, 2))
+
+        # 3. Selective projection for dt, B, C
+        projected = self.x_proj(x_inner)
+        dt_raw, B_ssm, C_ssm = torch.split(projected, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt_raw))
+
+        # 4. Selective scan
+        y = self._ssm_scan(x_inner, dt, B_ssm, C_ssm)
+
+        # 5. Output gating with SiLU
         y = y * F.silu(z)
         return self.out_proj(y)
 
 
 class MambaLayer(nn.Module):
-    """Pre-norm Mamba layer."""
-    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    """Pre-norm Mamba Layer."""
+
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2, backend: str = "auto"):
         super().__init__()
-        self.norm = QwenRMSNorm(d_model)
-        self.mamba = MambaBlock(d_model, d_state, d_conv, expand)
-    
-    def forward(self, x):
+        self.norm = RMSNorm(d_model)
+        self.mamba = MambaBlock(d_model, d_state, d_conv, expand, backend=backend)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.mamba(self.norm(x))
 
 
 class MambaLM(nn.Module):
     """
-    Mamba Language Model.
+    Mamba Language Model (~50M parameters).
     
-    Architecture: Embedding → N × MambaLayer → RMSNorm → LM Head
+    Architecture:
+      Embedding -> N × MambaLayer -> RMSNorm -> Tied LM Head
     """
+
     ARCH_NAME = "mamba"
-    
+
     def __init__(
         self,
         vocab_size: int,
         d_model: int = 512,
-        n_layers: int = 24,
+        n_layers: int = 28,
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
         dropout: float = 0.0,
+        backend: str = "auto",
     ):
         super().__init__()
+        self.vocab_size = vocab_size
         self.d_model = d_model
-        
+        self.n_layers = n_layers
+
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.drop = nn.Dropout(dropout)
-        
+
         self.layers = nn.ModuleList([
-            MambaLayer(d_model, d_state, d_conv, expand)
+            MambaLayer(d_model, d_state, d_conv, expand, backend=backend)
             for _ in range(n_layers)
         ])
-        
-        self.norm = QwenRMSNorm(d_model)
+
+        self.norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+        # Weight tying
         self.lm_head.weight = self.tok_emb.weight
-        
+
         self._init_weights()
-    
+
     def _init_weights(self):
-        for name, p in self.named_parameters():
-            if p.dim() > 1:
-                nn.init.normal_(p, mean=0.0, std=0.02)
-    
+        """Initialize embedding properly without destroying Mamba internal state matrix init."""
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+        # Rescale out_proj weights by 1 / sqrt(2 * n_layers) for residual stability
+        for layer in self.layers:
+            if hasattr(layer.mamba, "out_proj"):
+                nn.init.normal_(layer.mamba.out_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.n_layers))
+
     def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None):
         h = self.drop(self.tok_emb(x))
-        
+
         for layer in self.layers:
             h = layer(h)
-        
+
         h = self.norm(h)
         logits = self.lm_head(h)
-        
+
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 targets.reshape(-1),
-                ignore_index=-100,
+                ignore_index=IGNORE_INDEX,
             )
-        
+
         return logits, loss
-    
-    def count_params(self):
+
+    def count_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
-    
-    def count_trainable_params(self):
+
+    def count_trainable_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def create_mamba(vocab_size: int, target_params: int = 50_000_000) -> MambaLM:
-    """Create a Mamba LM targeting ~48M-50M parameters."""
+def estimate_mamba_parameters(vocab_size: int, d_model: int, n_layers: int, expand: int = 2, d_state: int = 16, d_conv: int = 4) -> int:
+    """Analytical parameter count for Mamba with tied embeddings."""
+    d_inner = d_model * expand
+    dt_rank = math.ceil(d_model / 16)
+    
+    in_proj = d_model * (2 * d_inner)
+    conv1d = d_conv * d_inner
+    x_proj = d_inner * (dt_rank + 2 * d_state)
+    dt_proj = dt_rank * d_inner + d_inner
+    out_proj = d_inner * d_model
+    mamba_params = in_proj + conv1d + x_proj + dt_proj + out_proj + d_state * d_inner + d_inner
+    layer_norm = d_model
+    per_layer = mamba_params + layer_norm
+
+    embedding_tied = vocab_size * d_model
+    final_norm = d_model
+    return embedding_tied + n_layers * per_layer + final_norm
+
+
+def choose_near_target_mamba_config(vocab_size: int, target_params: int = 50_000_000) -> Dict[str, Any]:
+    """Search viable Mamba configurations to match target_params."""
+    candidates = []
+    for d_model in (384, 448, 512, 576):
+        for n_layers in range(16, 36, 2):
+            params = estimate_mamba_parameters(vocab_size, d_model, n_layers)
+            diff = abs(params - target_params)
+            candidates.append((diff, params, {"d_model": d_model, "n_layers": n_layers}))
+    return min(candidates, key=lambda x: x[0])[2]
+
+
+def create_mamba(vocab_size: int = 3919, target_params: int = 50_000_000, backend: str = "auto") -> MambaLM:
+    """Create a Mamba LM targeting ~50M parameters."""
+    cfg = choose_near_target_mamba_config(vocab_size, target_params)
     return MambaLM(
         vocab_size=vocab_size,
-        d_model=512,
-        n_layers=28,
+        d_model=cfg["d_model"],
+        n_layers=cfg["n_layers"],
         d_state=16,
         d_conv=4,
         expand=2,
+        backend=backend,
     )
