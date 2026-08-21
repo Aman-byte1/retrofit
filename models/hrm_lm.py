@@ -1,7 +1,7 @@
 """
 HRM-Text: Hierarchical Reasoning Model for Language (~50M params).
 
-Official PyTorch adaptation of Sapient Intelligence's HRM-Text:
+A compact PyTorch adaptation of Sapient Intelligence's official HRM-Text implementation:
   https://github.com/sapientinc/HRM-Text (Apache-2.0)
   "HRM-Text: Efficient Pretraining Beyond Scaling" (Wang et al., 2026)
 
@@ -11,11 +11,12 @@ Key Architecture Details:
   • Additive H/L state injection (z_l + z_h and z_h + z_l)
   • MagicNorm: parameterless Pre-RMSNorm blocks + module-exit RMSNorm
   • Warmup deep credit assignment (truncated BPTT horizon: bp_min -> bp_max)
-  • PrefixLM attention masking (bidirectional prompt, causal response)
+  • PrefixLM attention masking (bidirectional prompt, causal response, padding exclusion)
   • Sigmoid-gated multi-head self-attention with full RoPE
   • Gradient checkpointing support for efficient memory reuse
   • SwiGLU FFN and truncated LeCun-normal initialization
   • Scaled, untied token embedding and linear output head
+  • Zero-gradient embedding edge for seamless DDP compatibility
 """
 
 import math
@@ -121,6 +122,9 @@ def build_prefix_lm_mask(
       - Padding tokens are excluded.
     Returns (mask, is_causal).
     """
+    if mode not in {"prefix", "causal"}:
+        raise ValueError(f"mode must be 'prefix' or 'causal', got {mode!r}")
+
     if mode == "causal" and bool(torch.all(valid_lengths == sequence_length)):
         return None, True
 
@@ -313,6 +317,9 @@ class HRMCore(nn.Module):
         if bp_steps is None:
             bp_steps = 5
 
+        if not (2 <= bp_steps <= total_recurrent_steps):
+            raise ValueError(f"bp_steps must be between 2 and {total_recurrent_steps}, got {bp_steps}")
+
         h_bp_steps = min(self.H_cycles, max(1, bp_steps - 1))
         l_bp_steps = max(1, bp_steps - h_bp_steps)
         total_l_steps = self.H_cycles * self.L_cycles
@@ -348,18 +355,18 @@ class HRMLM(nn.Module):
         self,
         vocab_size: int,
         hidden_size: int = 384,
-        total_layers: int = 24,
+        total_layers: int = 14,
         num_heads: int = 6,
         expansion: float = 4.0,
         H_cycles: int = 2,
         L_cycles: int = 3,
-        max_seq_len: int = 4096,
+        max_seq_len: int = 1024,
         rope_theta: float = 10_000.0,
         norm_eps: float = 1e-6,
         bp_min_steps: int = 2,
         bp_max_steps: int = 5,
         bp_warmup_ratio: float = 0.2,
-        gradient_checkpointing: bool = False,
+        gradient_checkpointing: bool = True,
     ):
         super().__init__()
         if total_layers % 2 != 0:
@@ -427,6 +434,9 @@ class HRMLM(nn.Module):
         if bp_steps is None:
             bp_steps = self.bp_max_steps
 
+        if not (self.bp_min_steps <= bp_steps <= self.bp_max_steps):
+            raise ValueError(f"bp_steps must be in [{self.bp_min_steps}, {self.bp_max_steps}], got {bp_steps}")
+
         if prefix_lengths is None:
             prefix_lengths = torch.zeros(batch, dtype=torch.long, device=x.device)
         if valid_lengths is None:
@@ -441,15 +451,25 @@ class HRMLM(nn.Module):
         hidden = self.core(
             embeddings, position_ids, attention_mask=attention_mask, is_causal=is_causal, bp_steps=bp_steps
         )
+
+        # Zero-gradient edge ensures DDP tracks embedding parameters during truncated horizons
+        if self.training and torch.is_grad_enabled():
+            hidden = hidden + embeddings * 0.0
+
         logits = self.lm_head(hidden)
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                targets.reshape(-1),
+            flat_logits = logits.float().reshape(-1, logits.size(-1))
+            flat_targets = targets.reshape(-1)
+            loss_sum = F.cross_entropy(
+                flat_logits,
+                flat_targets,
                 ignore_index=IGNORE_INDEX,
+                reduction="sum",
             )
+            valid_tokens = (flat_targets != IGNORE_INDEX).sum()
+            loss = loss_sum / valid_tokens.clamp_min(1)
 
         return logits, loss
 
@@ -486,7 +506,7 @@ def choose_near_target_hrm_config(vocab_size: int, target_params: int = 50_000_0
     return min(candidates, key=lambda x: x[0])[2]
 
 
-def create_hrm(vocab_size: int, target_params: int = 50_000_000) -> HRMLM:
+def create_hrm(vocab_size: int = 30_000, target_params: int = 50_000_000) -> HRMLM:
     """Create an HRM-Text model targeting approximately target_params (~50M)."""
     cfg = choose_near_target_hrm_config(vocab_size, target_params)
     return HRMLM(
@@ -497,7 +517,9 @@ def create_hrm(vocab_size: int, target_params: int = 50_000_000) -> HRMLM:
         expansion=4.0,
         H_cycles=2,
         L_cycles=3,
-        max_seq_len=4096,
+        max_seq_len=1024,
         bp_min_steps=2,
         bp_max_steps=5,
+        bp_warmup_ratio=0.2,
+        gradient_checkpointing=True,
     )
