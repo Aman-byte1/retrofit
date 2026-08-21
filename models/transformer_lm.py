@@ -1,25 +1,25 @@
 """
-Qwen3.5 / Qwen3.8 Language Model Architecture (~50M params).
+Qwen3.5 / Qwen3.8 Language Model Architecture.
 
-Complete, exact implementation of the Qwen3.5 text-only dense backbone:
-  • 3:1 Gated DeltaNet / Gated Full-Attention hybrid blocks
+Exact text-only dense backbone matching Qwen3.5 and Qwen3.8:
+  • 3:1 Gated DeltaNet / Gated Full-Attention repeating blocks
   • Causal depthwise convolution in DeltaNet
-  • Chunk-parallel gated delta rule (differentiable, linear sequence complexity)
-  • Grouped-Query Full Attention with Q/K norm, Partial RoPE, and output sigmoid gate
+  • Chunk-parallel gated delta rule (differentiable, linear O(N) sequence complexity)
+  • Grouped-Query Full Attention with Q/K norm, Partial RoPE (factor=0.25), and output sigmoid gate
   • Zero-Centered RMSNorm and SwiGLU MLP
-  • Optional Multi-Token Prediction (MTP) auxiliary objective
+  • Full Multi-Token Prediction (MTP) auxiliary objective module
+  • Strict configuration validation
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any
 
 
 # -----------------------------------------------------------------------------
-# Core Normalization & RoPE
+# Core Normalization & Partial RoPE
 
 
 class ZeroCenteredRMSNorm(nn.Module):
@@ -55,36 +55,14 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def precompute_rope(dim: int, max_seq_len: int, theta: float = 10_000_000.0) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Precompute RoPE frequencies."""
-    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    t = torch.arange(max_seq_len, dtype=torch.float32)
-    freqs = torch.outer(t, inv_freq)
-    cos = freqs.cos()
-    sin = freqs.sin()
-    return cos, sin
-
-
-def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply Rotary Position Embeddings (RoPE)."""
-    B, H, S, D = x.shape
-    cos = cos[:S].unsqueeze(0).unsqueeze(0)
-    sin = sin[:S].unsqueeze(0).unsqueeze(0)
-    x1 = x[..., :D // 2]
-    x2 = x[..., D // 2:]
-    out1 = x1 * cos - x2 * sin
-    out2 = x2 * cos + x1 * sin
-    return torch.cat([out1, out2], dim=-1)
-
-
 class PartialRoPE(nn.Module):
-    """Qwen3.5 partial rotary embeddings applied to a fraction of the head dimension."""
+    """Qwen3.5 partial rotary embeddings (default: 0.25 factor = 1/4 of head_dim rotated)."""
 
-    def __init__(self, head_dim: int, fraction: float = 0.5, theta: float = 10_000_000.0):
+    def __init__(self, head_dim: int, fraction: float = 0.25, theta: float = 10_000_000.0):
         super().__init__()
         self.dim = int(head_dim * fraction)
-        if self.dim % 2 != 0:
-            self.dim -= 1
+        if self.dim <= 0 or self.dim % 2 != 0 or self.dim > head_dim:
+            raise ValueError(f"Invalid partial RoPE dimension {self.dim} for head_dim {head_dim}")
         inv = 1.0 / (theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim))
         self.register_buffer("inv_freq", inv, persistent=False)
 
@@ -105,11 +83,11 @@ class PartialRoPE(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Gated Full Attention
+# Gated Full Attention (with QK-Norm & Partial RoPE)
 
 
 class GatedAttention(nn.Module):
-    """Qwen3.5 gated grouped-query attention with Q/K norm and partial RoPE."""
+    """Qwen3.5 gated grouped-query attention with Q/K norm, partial RoPE, and output gate."""
 
     def __init__(
         self,
@@ -118,11 +96,14 @@ class GatedAttention(nn.Module):
         num_key_value_heads: int = 4,
         head_dim: int = 64,
         attention_dropout: float = 0.0,
-        partial_rotary_factor: float = 0.5,
+        partial_rotary_factor: float = 0.25,
         rope_theta: float = 10_000_000.0,
         rms_norm_eps: float = 1e-6,
     ):
         super().__init__()
+        if num_attention_heads % num_key_value_heads != 0:
+            raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
+
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
         self.head_dim = head_dim
@@ -164,7 +145,7 @@ class GatedAttention(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Gated DeltaNet (Chunk-Parallel Delta Rule)
+# Gated DeltaNet (Chunk-Parallel Differentiable Gated Delta Rule)
 
 
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -179,10 +160,7 @@ def chunk_gated_delta_rule(
     beta: torch.Tensor,
     chunk_size: int,
 ) -> torch.Tensor:
-    """
-    Differentiable chunk-parallel gated delta rule.
-    Computes in fp32 for stability and is linear O(N) in sequence length.
-    """
+    """Differentiable chunk-parallel gated delta rule in pure PyTorch."""
     original_dtype = query.dtype
     query = l2norm(query).transpose(1, 2).contiguous().float()
     key = l2norm(key).transpose(1, 2).contiguous().float()
@@ -261,6 +239,9 @@ class GatedDeltaNet(nn.Module):
         rms_norm_eps: float = 1e-6,
     ):
         super().__init__()
+        if linear_num_value_heads % linear_num_key_heads != 0:
+            raise ValueError("linear_num_value_heads must be divisible by linear_num_key_heads")
+
         self.num_k_heads = linear_num_key_heads
         self.num_v_heads = linear_num_value_heads
         self.k_dim = linear_key_head_dim
@@ -329,7 +310,7 @@ class Qwen35SwiGLU(nn.Module):
 
 
 class Qwen35DecoderLayer(nn.Module):
-    """Qwen3.5 Decoder Layer: alternates between GatedDeltaNet and GatedAttention."""
+    """Qwen3.5 Decoder Layer: 3:1 DeltaNet-to-Attention ratio."""
 
     def __init__(
         self,
@@ -346,7 +327,7 @@ class Qwen35DecoderLayer(nn.Module):
         linear_value_head_dim: int = 64,
         linear_conv_kernel_dim: int = 4,
         delta_chunk_size: int = 16,
-        partial_rotary_factor: float = 0.5,
+        partial_rotary_factor: float = 0.25,
         rope_theta: float = 10_000_000.0,
         rms_norm_eps: float = 1e-6,
         residual_dropout: float = 0.0,
@@ -364,6 +345,7 @@ class Qwen35DecoderLayer(nn.Module):
                 partial_rotary_factor=partial_rotary_factor,
                 rope_theta=rope_theta,
                 rms_norm_eps=rms_norm_eps,
+                attention_dropout=residual_dropout,
             )
         else:
             self.mixer = GatedDeltaNet(
@@ -389,17 +371,71 @@ class Qwen35DecoderLayer(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Full Qwen3.5 Model
+# Multi-Token Prediction (MTP) Head
+
+
+class MTPHead(nn.Module):
+    """
+    Qwen3.5-style next-next-token prediction head (MTP).
+    Consumes backbone hidden states + actual token t+1 embeddings to predict token t+2.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 512,
+        intermediate_size: int = 1408,
+        num_attention_heads: int = 8,
+        num_key_value_heads: int = 4,
+        head_dim: int = 64,
+        mtp_num_hidden_layers: int = 1,
+        partial_rotary_factor: float = 0.25,
+        rope_theta: float = 10_000_000.0,
+        rms_norm_eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.pre_fc_norm_hidden = ZeroCenteredRMSNorm(hidden_size, rms_norm_eps)
+        self.pre_fc_norm_embedding = ZeroCenteredRMSNorm(hidden_size, rms_norm_eps)
+        self.fc = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+        self.layers = nn.ModuleList([
+            Qwen35DecoderLayer(
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                index=i,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                partial_rotary_factor=partial_rotary_factor,
+                rope_theta=rope_theta,
+                rms_norm_eps=rms_norm_eps,
+                force_full_attention=True,
+            )
+            for i in range(mtp_num_hidden_layers)
+        ])
+        self.norm = ZeroCenteredRMSNorm(hidden_size, rms_norm_eps)
+
+    def forward(self, hidden: torch.Tensor, next_ids: torch.Tensor, embedding: nn.Embedding) -> torch.Tensor:
+        e = self.pre_fc_norm_embedding(embedding(next_ids))
+        h = self.pre_fc_norm_hidden(hidden)
+        x = self.fc(torch.cat((e, h), dim=-1))
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
+
+
+# -----------------------------------------------------------------------------
+# Full Qwen3.5 Architecture Model
 
 
 class TransformerLM(nn.Module):
     """
-    Qwen3.5 Language Model.
+    Complete Qwen3.5 / Qwen3.8 Language Model.
     
     Equipped with:
-      - 3:1 Gated DeltaNet / Full-Attention hybrid layers
+      - 3:1 Gated DeltaNet / Full-Attention hybrid layers (exact 12:4 or 9:3 ratio)
       - Zero-Centered RMSNorm
       - SwiGLU MLP
+      - Multi-Token Prediction (MTP) auxiliary head
+      - Partial RoPE (factor = 0.25)
       - Tie word embeddings
     """
 
@@ -421,15 +457,27 @@ class TransformerLM(nn.Module):
         linear_value_head_dim: int = 64,
         linear_conv_kernel_dim: int = 4,
         delta_chunk_size: int = 16,
-        partial_rotary_factor: float = 0.5,
+        partial_rotary_factor: float = 0.25,
         rope_theta: float = 10_000_000.0,
         rms_norm_eps: float = 1e-6,
         dropout: float = 0.0,
         tie_word_embeddings: bool = True,
+        mtp_num_hidden_layers: int = 1,
+        mtp_loss_weight: float = 0.1,
     ):
         super().__init__()
+        # Strict configuration validation
+        if num_attention_heads % num_key_value_heads != 0:
+            raise ValueError(f"num_attention_heads ({num_attention_heads}) must be divisible by num_key_value_heads ({num_key_value_heads})")
+        if linear_num_value_heads % linear_num_key_heads != 0:
+            raise ValueError(f"linear_num_value_heads ({linear_num_value_heads}) must be divisible by linear_num_key_heads ({linear_num_key_heads})")
+        rope_dim = int(head_dim * partial_rotary_factor)
+        if rope_dim <= 0 or rope_dim % 2 != 0 or rope_dim > head_dim:
+            raise ValueError(f"Invalid partial RoPE dimension {rope_dim} for head_dim {head_dim} (must be even and <= head_dim)")
+
         self.d_model = d_model
         self.vocab_size = vocab_size
+        self.mtp_loss_weight = mtp_loss_weight
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.drop = nn.Dropout(dropout)
@@ -460,6 +508,21 @@ class TransformerLM(nn.Module):
         self.norm = ZeroCenteredRMSNorm(d_model, rms_norm_eps)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
+        # MTP Head
+        self.mtp = None
+        if mtp_num_hidden_layers > 0:
+            self.mtp = MTPHead(
+                hidden_size=d_model,
+                intermediate_size=intermediate_size,
+                num_attention_heads=num_attention_heads,
+                num_key_value_heads=num_key_value_heads,
+                head_dim=head_dim,
+                mtp_num_hidden_layers=mtp_num_hidden_layers,
+                partial_rotary_factor=partial_rotary_factor,
+                rope_theta=rope_theta,
+                rms_norm_eps=rms_norm_eps,
+            )
+
         if tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
 
@@ -469,6 +532,8 @@ class TransformerLM(nn.Module):
         for name, p in self.named_parameters():
             if p.dim() > 1:
                 nn.init.normal_(p, mean=0.0, std=0.02)
+            elif "bias" in name:
+                nn.init.zeros_(p)
 
     def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None):
         h = self.drop(self.tok_emb(x))
@@ -476,21 +541,37 @@ class TransformerLM(nn.Module):
         for layer in self.layers:
             h = layer(h)
 
-        h = self.norm(h)
-        logits = self.lm_head(h)
+        raw_hidden = h
+        logits = self.lm_head(self.norm(raw_hidden))
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=0,
+            base_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-100,
             )
+            loss = base_loss
+
+            # Multi-Token Prediction auxiliary loss
+            if self.mtp is not None and x.shape[1] > 1:
+                mtp_hidden = self.mtp(raw_hidden[:, :-1], x[:, 1:], self.tok_emb)
+                mtp_logits = self.lm_head(mtp_hidden)
+                mtp_targets = targets[:, 1:]
+                mtp_loss = F.cross_entropy(
+                    mtp_logits.reshape(-1, mtp_logits.size(-1)),
+                    mtp_targets.reshape(-1),
+                    ignore_index=-100,
+                )
+                loss = base_loss + self.mtp_loss_weight * mtp_loss
 
         return logits, loss
 
-    def count_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+    def count_params(self, exclude_mtp: bool = False) -> int:
+        if not exclude_mtp or self.mtp is None:
+            return sum(p.numel() for p in self.parameters())
+        mtp_ids = {id(p) for p in self.mtp.parameters()}
+        return sum(p.numel() for p in self.parameters() if id(p) not in mtp_ids)
 
     def count_trainable_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -503,12 +584,15 @@ Qwen3Attention = GatedAttention
 
 
 def create_transformer(vocab_size: int, target_params: int = 50_000_000) -> TransformerLM:
-    """Create a Qwen3.5 (DeltaNet + Gated Attention) model targeting ~49M-50M params."""
+    """
+    Create a Qwen3.5 model with 16 layers (exact 12:4 = 3:1 DeltaNet-to-Attention ratio),
+    partial_rotary_factor=0.25, and MTP head.
+    """
     return TransformerLM(
         vocab_size=vocab_size,
         d_model=512,
-        n_layers=14,
-        intermediate_size=1408,
+        n_layers=16,
+        intermediate_size=1280,
         full_attention_interval=4,
         num_attention_heads=8,
         num_key_value_heads=4,
@@ -519,6 +603,8 @@ def create_transformer(vocab_size: int, target_params: int = 50_000_000) -> Tran
         linear_value_head_dim=64,
         linear_conv_kernel_dim=4,
         delta_chunk_size=16,
-        partial_rotary_factor=0.5,
+        partial_rotary_factor=0.25,
         rope_theta=10_000_000.0,
+        mtp_num_hidden_layers=1,
+        mtp_loss_weight=0.1,
     )

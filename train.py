@@ -263,11 +263,16 @@ def train_model(
     logger.info(f"Train: {len(train_ds)} sequences ({len(train_ds) * seq_len:,} tokens)")
     logger.info(f"Val:   {len(val_ds)} sequences ({len(val_ds) * seq_len:,} tokens)")
     
-    # Optimizer
+    # Optimizer with parameter grouping (weight decay only on 2D+ tensors, 0.0 on norms & biases)
+    decay_params = [p for p in model.parameters() if p.requires_grad and p.dim() >= 2]
+    nodecay_params = [p for p in model.parameters() if p.requires_grad and p.dim() < 2]
+    optim_groups = [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": nodecay_params, "weight_decay": 0.0},
+    ]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        optim_groups,
         lr=lr,
-        weight_decay=weight_decay,
         betas=(0.9, 0.95),
     )
     

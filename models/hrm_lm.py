@@ -22,12 +22,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from .transformer_lm import QwenRMSNorm, Qwen3MLP, precompute_rope, apply_rope
+from .transformer_lm import QwenRMSNorm, Qwen3MLP, PartialRoPE
 
 
 class HRMAttention(nn.Module):
-    """Multi-Head Attention with QK-Norm and RoPE for HRM modules."""
-    def __init__(self, d_model: int, n_heads: int, max_seq_len: int = 4096, rope_theta: float = 1000000.0):
+    """Multi-Head Attention with QK-Norm and Partial RoPE for HRM modules."""
+    def __init__(self, d_model: int, n_heads: int, max_seq_len: int = 4096, rope_theta: float = 10_000_000.0):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
@@ -40,10 +40,7 @@ class HRMAttention(nn.Module):
         # QK-Norm
         self.q_norm = QwenRMSNorm(self.head_dim)
         self.k_norm = QwenRMSNorm(self.head_dim)
-        
-        cos, sin = precompute_rope(self.head_dim, max_seq_len, theta=rope_theta)
-        self.register_buffer("rope_cos", cos, persistent=False)
-        self.register_buffer("rope_sin", sin, persistent=False)
+        self.rope = PartialRoPE(self.head_dim, fraction=0.25, theta=rope_theta)
     
     def forward(self, x: torch.Tensor, causal: bool = True):
         B, S, D = x.shape
@@ -54,8 +51,7 @@ class HRMAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         
-        q = apply_rope(q, self.rope_cos, self.rope_sin)
-        k = apply_rope(k, self.rope_cos, self.rope_sin)
+        q, k = self.rope(q, k)
         
         out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
         return self.wo(out.transpose(1, 2).contiguous().view(B, S, D))
@@ -226,9 +222,9 @@ class HRMLM(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=0,
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-100,
             )
         
         return logits, loss
