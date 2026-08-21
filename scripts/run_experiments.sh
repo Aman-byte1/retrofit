@@ -108,14 +108,15 @@ echo "============================================================"
 if has_checkpoint "mamba"; then
     echo "  ✓ Mamba already trained! Skipping to next architecture."
 else
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     python train.py \
         --arch mamba \
         --vocab-size $VOCAB_SIZE \
         --data-dir data/tokenized \
         --output-dir $RESULTS_DIR \
         --epochs $EPOCHS \
-        --batch-size $BATCH_SIZE \
-        --grad-accum 1 \
+        --batch-size 16 \
+        --grad-accum 4 \
         --warmup-steps $WARMUP_STEPS \
         --seq-len $SEQ_LEN \
         --lr $LR \
@@ -132,14 +133,15 @@ echo "============================================================"
 if has_checkpoint "hybrid"; then
     echo "  ✓ Hybrid already trained! Skipping to next architecture."
 else
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     python train.py \
         --arch hybrid \
         --vocab-size $VOCAB_SIZE \
         --data-dir data/tokenized \
         --output-dir $RESULTS_DIR \
         --epochs $EPOCHS \
-        --batch-size $BATCH_SIZE \
-        --grad-accum 1 \
+        --batch-size 16 \
+        --grad-accum 4 \
         --warmup-steps $WARMUP_STEPS \
         --seq-len $SEQ_LEN \
         --lr $LR \
