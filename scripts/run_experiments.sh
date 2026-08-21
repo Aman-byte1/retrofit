@@ -1,94 +1,146 @@
 #!/bin/bash
 # ============================================================
-# Retrofit: Full Experiment Pipeline (2x A40 GPUs)
+# Full Architecture Comparison Benchmark
 #
-# Runs the complete research experiment:
-# 1. Baseline: TTS without voice cloning
-# 2. Retrofit with FiLM adapter
-# 3. Retrofit with Additive adapter (ablation)
-# 4. Cross-language transfer test
-# 5. Analysis & report generation
+# Trains 4 architectures on Amharic Wikipedia, benchmarks all,
+# and generates analysis report.
+#
+# Total estimated time: ~2-3 hours on A100
 # ============================================================
 set -euo pipefail
 
+EPOCHS=10
+BATCH_SIZE=32
+SEQ_LEN=512
+LR=3e-4
+VOCAB_SIZE=3919
+RESULTS_DIR="results"
+
 echo "============================================================"
-echo "  Retrofit: Efficient Voice Cloning Experiments"
-echo "  Architecture: Speaker Encoder → Adapter → Frozen TTS"
+echo "  Amharic LM Architecture Comparison"
+echo "  Architectures: Transformer, HRM, Mamba, Hybrid"
+echo "  Tokenizer: RL-trained Amharic (${VOCAB_SIZE} tokens)"
+echo "  Target: ~50M parameters each"
 echo "  $(date)"
 echo "============================================================"
 
-# Fix: torchcodec has a broken libnvrtc dependency in this Docker image.
-# Uninstall it so HF datasets falls back to soundfile for audio decoding.
-pip uninstall -y torchcodec 2>/dev/null || true
-
-CONFIG="configs/default.yaml"
-OUTPUT_DIR="experiments"
-MAX_EVAL=50  # Samples per language for eval. Remove limit for full run.
+# ============================================================
+# Step 0: Setup (if not already done)
+# ============================================================
+if [ ! -f "data/tokenized/train_tokens.npy" ]; then
+    echo ""
+    echo "[0/6] Running setup..."
+    bash scripts/setup.sh
+fi
 
 # ============================================================
-# Experiment 1: Baseline (TTS only, no voice cloning)
+# Step 1: Train Transformer
 # ============================================================
 echo ""
-echo "[1/5] Baseline: MMS-TTS without voice cloning..."
-python -m retrofit.evaluate \
-    --config $CONFIG \
-    --language fr \
-    --no-adapter \
-    --max-samples $MAX_EVAL \
-    --output-dir $OUTPUT_DIR
+echo "============================================================"
+echo "[1/6] Training: TRANSFORMER (Llama-style, RoPE+SwiGLU)"
+echo "============================================================"
+python train.py \
+    --arch transformer \
+    --vocab-size $VOCAB_SIZE \
+    --train-data data/tokenized/train_tokens.npy \
+    --val-data data/tokenized/val_tokens.npy \
+    --output-dir $RESULTS_DIR \
+    --epochs $EPOCHS \
+    --batch-size $BATCH_SIZE \
+    --seq-len $SEQ_LEN \
+    --lr $LR
 
 # ============================================================
-# Experiment 2: Retrofit with FiLM Adapter (main method)
+# Step 2: Train HRM
 # ============================================================
 echo ""
-echo "[2/5] Training FiLM adapter on French data..."
-python -m retrofit.train \
-    --config $CONFIG \
-    --language fr \
-    --adapter-type film \
-    --epochs 100 \
-    --data-source iwslt \
-    --experiment-name retrofit_film_fr \
-    --output-dir $OUTPUT_DIR
+echo "============================================================"
+echo "[2/6] Training: HRM (Hierarchical Recurrent Memory)"
+echo "============================================================"
+python train.py \
+    --arch hrm \
+    --vocab-size $VOCAB_SIZE \
+    --train-data data/tokenized/train_tokens.npy \
+    --val-data data/tokenized/val_tokens.npy \
+    --output-dir $RESULTS_DIR \
+    --epochs $EPOCHS \
+    --batch-size $BATCH_SIZE \
+    --seq-len $SEQ_LEN \
+    --lr $LR
 
 # ============================================================
-# Experiment 3: Retrofit with Additive Adapter (ablation)
+# Step 3: Train Mamba
 # ============================================================
 echo ""
-echo "[3/5] Training Additive adapter (ablation)..."
-python -m retrofit.train \
-    --config $CONFIG \
-    --language fr \
-    --adapter-type additive \
-    --epochs 100 \
-    --data-source iwslt \
-    --experiment-name retrofit_additive_fr \
-    --output-dir $OUTPUT_DIR
+echo "============================================================"
+echo "[3/6] Training: MAMBA (Selective State Space Model)"
+echo "============================================================"
+python train.py \
+    --arch mamba \
+    --vocab-size $VOCAB_SIZE \
+    --train-data data/tokenized/train_tokens.npy \
+    --val-data data/tokenized/val_tokens.npy \
+    --output-dir $RESULTS_DIR \
+    --epochs $EPOCHS \
+    --batch-size $BATCH_SIZE \
+    --seq-len $SEQ_LEN \
+    --lr $LR
 
 # ============================================================
-# Experiment 4: Cross-Language Transfer
+# Step 4: Train Hybrid
 # ============================================================
 echo ""
-echo "[4/5] Testing cross-language transfer (adapter trained on FR, tested on AR & ZH)..."
-# Use the French-trained FiLM adapter on Arabic and Chinese
-python -m retrofit.evaluate \
-    --config $CONFIG \
-    --language ar zh \
-    --adapter-path $OUTPUT_DIR/retrofit_film_fr/adapter_best.pt \
-    --max-samples $MAX_EVAL \
-    --output-dir $OUTPUT_DIR/cross_language_transfer
+echo "============================================================"
+echo "[4/6] Training: HYBRID (Mamba + Transformer Attention)"
+echo "============================================================"
+python train.py \
+    --arch hybrid \
+    --vocab-size $VOCAB_SIZE \
+    --train-data data/tokenized/train_tokens.npy \
+    --val-data data/tokenized/val_tokens.npy \
+    --output-dir $RESULTS_DIR \
+    --epochs $EPOCHS \
+    --batch-size $BATCH_SIZE \
+    --seq-len $SEQ_LEN \
+    --lr $LR
 
 # ============================================================
-# Analysis
+# Step 5: Benchmark all models
 # ============================================================
 echo ""
-echo "[5/5] Generating analysis..."
-python -m retrofit.analyze \
-    --results-dir $OUTPUT_DIR \
-    --output-dir $OUTPUT_DIR/analysis
+echo "============================================================"
+echo "[5/6] Benchmarking: Throughput, VRAM, and Generation Latency"
+echo "============================================================"
+
+for ARCH in transformer hrm mamba hybrid; do
+    echo ""
+    echo "--- Benchmarking ${ARCH} ---"
+    python benchmark.py \
+        --arch $ARCH \
+        --vocab-size $VOCAB_SIZE \
+        --checkpoint $RESULTS_DIR/$ARCH/best_model.pt \
+        --output-dir $RESULTS_DIR \
+        --seq-lengths 128 256 512 1024 2048 4096
+done
+
+# ============================================================
+# Step 6: Analysis
+# ============================================================
+echo ""
+echo "============================================================"
+echo "[6/6] Generating analysis report and plots"
+echo "============================================================"
+python analyze.py \
+    --results-dir $RESULTS_DIR \
+    --output-dir $RESULTS_DIR/analysis
 
 echo ""
 echo "============================================================"
-echo "  All experiments complete!"
-echo "  Results: $OUTPUT_DIR/analysis/"
+echo "  ALL EXPERIMENTS COMPLETE!"
+echo "  Results:  ${RESULTS_DIR}/analysis/"
+echo "  Report:   ${RESULTS_DIR}/analysis/report.md"
+echo "  LaTeX:    ${RESULTS_DIR}/analysis/results_table.tex"
+echo "  Plots:    ${RESULTS_DIR}/analysis/*.png"
+echo "  $(date)"
 echo "============================================================"
