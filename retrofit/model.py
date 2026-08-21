@@ -1,495 +1,389 @@
 """
-Model wrapper: F5-TTS with LoRA adapter injection.
+RetrofitVoiceCloner: The complete retrofit architecture.
 
-Provides a unified interface for:
-- Loading the pretrained F5-TTS model
-- Injecting LoRA adapters (uniform or targeted)
-- Running inference (zero-shot and adapted)
-- Training with flow matching loss
+Adds zero-shot voice cloning to TTS models that DON'T have it.
+
+Architecture (matching the diagram):
+    ┌──────────────┐
+    │   Speaker    │
+    │   Encoder    │──► Speaker Embedding (192-dim)
+    │  (frozen)    │        │
+    └──────────────┘        ▼
+                     ┌──────────────┐
+                     │   Adapter     │  ◄── ONLY this is trained
+                     │   Layers      │
+                     └──────┬───────┘
+                            │
+    ┌──────────────┐        ▼
+    │   Existing   │◄── Injected speaker conditioning (FiLM)
+    │   TTS Model  │
+    │  (frozen)    │
+    └──────┬───────┘
+           ▼
+      Cloned Speech
+
+Base TTS: MMS-TTS (Meta's single-speaker VITS, supports 1000+ languages)
+Speaker Encoder: ECAPA-TDNN (pre-trained on VoxCeleb)
+Adapter: FiLM-conditioned MLP (the ONLY trainable part)
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import logging
 import tempfile
 import soundfile as sf
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
-from .lora import (
-    inject_lora,
-    get_lora_params,
-    save_lora,
-    load_lora,
-    count_parameters,
-)
+from .speaker_encoder import SpeakerEncoder
+from .adapters import SpeakerAdapter, AdditiveAdapter
 
 logger = logging.getLogger(__name__)
 
+# MMS-TTS model IDs for supported languages
+MMS_MODELS = {
+    "fr": "facebook/mms-tts-fra",
+    "ar": "facebook/mms-tts-ara",
+    "zh": "facebook/mms-tts-cmn",
+    "en": "facebook/mms-tts-eng",
+    "es": "facebook/mms-tts-spa",
+    "de": "facebook/mms-tts-deu",
+    "ja": "facebook/mms-tts-jpn",
+    "ko": "facebook/mms-tts-kor",
+    "ru": "facebook/mms-tts-rus",
+    "pt": "facebook/mms-tts-por",
+}
 
-class RetrofitModel:
+
+class RetrofitVoiceCloner(nn.Module):
     """
-    F5-TTS model with optional LoRA adapters for efficient voice cloning.
+    Retrofits voice cloning into a non-cloning TTS model.
     
-    Supports multiple adaptation strategies:
-    - zero_shot: No adaptation, use F5-TTS as-is
-    - full_finetune: Train all parameters (expensive baseline)
-    - uniform_lora: LoRA on all attention layers
-    - targeted_lora: LoRA on only speaker-critical layers
+    The TTS model (MMS-TTS/VITS) is frozen. The speaker encoder is frozen.
+    ONLY the adapter layers are trained.
+    
+    During inference:
+    1. Speaker encoder extracts embedding from reference audio
+    2. Adapter projects embedding into TTS conditioning space
+    3. Conditioning is injected into the frozen TTS via FiLM hooks
+    4. TTS generates speech in the cloned voice
     """
     
     def __init__(self, config: Dict):
+        super().__init__()
         self.config = config
         self.device = config.get("device", "cuda")
-        self.adaptation_method = config.get("adaptation_method", "zero_shot")
         
-        # Load F5-TTS
-        self._load_model()
+        # ── 1. Load the frozen TTS model (no voice cloning) ──
+        self.language = config.get("language", "fr")
+        self._load_tts_model()
         
-        # Apply adaptation method
-        if self.adaptation_method != "zero_shot":
-            self._apply_adaptation()
-        
-        # Log parameter counts
-        param_info = count_parameters(self.f5tts.model)
-        logger.info(
-            f"Model parameters — Total: {param_info['total']:,}, "
-            f"Trainable: {param_info['trainable']:,} "
-            f"({param_info['trainable_pct']:.2f}%)"
+        # ── 2. Load the frozen speaker encoder ──
+        spk_cfg = config.get("speaker_encoder", {})
+        self.speaker_encoder = SpeakerEncoder(
+            model_name=spk_cfg.get("model", "speechbrain/spkrec-ecapa-voxceleb"),
+            device=self.device,
         )
-    
-    def _load_model(self):
-        """Load the pretrained F5-TTS model."""
-        from f5_tts.api import F5TTS
         
-        logger.info("Loading F5-TTS model...")
-        self.f5tts = F5TTS(
-            model_type=self.config.get("name", "F5-TTS"),
-            ckpt_file=self.config.get("ckpt_file", None),
-            vocab_file=self.config.get("vocab_file", None),
-        )
-        logger.info("F5-TTS loaded successfully")
-    
-    def _apply_adaptation(self):
-        """Apply the selected adaptation method."""
-        lora_config = self.config.get("lora", {})
+        # ── 3. Create the trainable adapter ──
+        adapter_cfg = config.get("adapter", {})
+        adapter_type = adapter_cfg.get("type", "film")
         
-        if self.adaptation_method == "full_finetune":
-            # All parameters trainable (expensive baseline)
-            for param in self.f5tts.model.parameters():
-                param.requires_grad = True
-            logger.info("Full fine-tuning mode: all parameters trainable")
+        tts_hidden_dim = self.tts_config.hidden_size
+        speaker_dim = SpeakerEncoder.EMBEDDING_DIM  # 192
         
-        elif self.adaptation_method == "uniform_lora":
-            # LoRA on all matching layers
-            stats = inject_lora(
-                self.f5tts.model,
-                rank=lora_config.get("rank", 8),
-                alpha=lora_config.get("alpha", 16),
-                dropout=lora_config.get("dropout", 0.05),
-                target_modules=lora_config.get("target_modules", None),
-                target_layers=None,  # All layers
+        if adapter_type == "film":
+            self.adapter = SpeakerAdapter(
+                speaker_dim=speaker_dim,
+                hidden_dim=adapter_cfg.get("hidden_dim", 256),
+                output_dim=tts_hidden_dim,
+                n_injection_points=adapter_cfg.get("n_injection_points", 3),
+                dropout=adapter_cfg.get("dropout", 0.1),
             )
-            logger.info(f"Uniform LoRA: {stats['injected_layers']} layers, "
-                       f"{stats['lora_params']:,} params")
-        
-        elif self.adaptation_method == "targeted_lora":
-            # LoRA on specific layers only
-            target_layers = lora_config.get("target_layers", None)
-            if target_layers is None:
-                logger.warning(
-                    "targeted_lora selected but no target_layers specified. "
-                    "Run layer analysis first, or falling back to uniform."
-                )
-            
-            stats = inject_lora(
-                self.f5tts.model,
-                rank=lora_config.get("rank", 8),
-                alpha=lora_config.get("alpha", 16),
-                dropout=lora_config.get("dropout", 0.05),
-                target_modules=lora_config.get("target_modules", None),
-                target_layers=target_layers,
+        elif adapter_type == "additive":
+            self.adapter = AdditiveAdapter(
+                speaker_dim=speaker_dim,
+                hidden_dim=adapter_cfg.get("hidden_dim", 256),
+                output_dim=tts_hidden_dim,
+                dropout=adapter_cfg.get("dropout", 0.1),
             )
-            logger.info(f"Targeted LoRA: {stats['injected_layers']} layers "
-                       f"(targets: {target_layers}), {stats['lora_params']:,} params")
-        
         else:
-            raise ValueError(f"Unknown adaptation method: {self.adaptation_method}")
+            raise ValueError(f"Unknown adapter type: {adapter_type}")
+        
+        # Storage for conditioning during forward pass
+        self._current_conditioning = None
+        self._hooks = []
+        
+        # Register injection hooks into the TTS model
+        self._register_injection_hooks()
+        
+        # Move adapter to device
+        self.adapter = self.adapter.to(self.device)
+        
+        # Log architecture summary
+        self._log_summary()
+    
+    def _load_tts_model(self):
+        """Load the frozen MMS-TTS (VITS) model."""
+        from transformers import VitsModel, VitsTokenizer
+        
+        model_id = MMS_MODELS.get(self.language)
+        if model_id is None:
+            raise ValueError(
+                f"Language '{self.language}' not supported. "
+                f"Available: {list(MMS_MODELS.keys())}"
+            )
+        
+        logger.info(f"Loading frozen TTS model: {model_id}")
+        self.tts_model = VitsModel.from_pretrained(model_id)
+        self.tts_tokenizer = VitsTokenizer.from_pretrained(model_id)
+        self.tts_config = self.tts_model.config
+        
+        # Freeze ALL TTS parameters
+        self.tts_model.eval()
+        for param in self.tts_model.parameters():
+            param.requires_grad = False
+        
+        self.tts_model = self.tts_model.to(self.device)
+        
+        tts_params = sum(p.numel() for p in self.tts_model.parameters())
+        logger.info(f"TTS model loaded and frozen ({tts_params:,} params, 0 trainable)")
+    
+    def _register_injection_hooks(self):
+        """
+        Register forward hooks to inject speaker conditioning into the TTS model.
+        
+        Injection points for VITS:
+        0. After text encoder → conditions the linguistic representation
+        1. Before flow module → conditions the latent space
+        2. Before decoder → conditions the waveform generation
+        """
+        # Remove any existing hooks
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks = []
+        
+        adapter_type = self.config.get("adapter", {}).get("type", "film")
+        
+        # Injection point 0: Text encoder output
+        if hasattr(self.tts_model, 'text_encoder'):
+            hook = self.tts_model.text_encoder.register_forward_hook(
+                self._make_injection_hook(0, adapter_type)
+            )
+            self._hooks.append(hook)
+            logger.info("  Hook registered: text_encoder output")
+        
+        # Injection point 1: Flow module
+        if hasattr(self.tts_model, 'flow'):
+            hook = self.tts_model.flow.register_forward_hook(
+                self._make_injection_hook(1, adapter_type)
+            )
+            self._hooks.append(hook)
+            logger.info("  Hook registered: flow output")
+        
+        # Injection point 2: Decoder
+        if hasattr(self.tts_model, 'decoder'):
+            # Hook on the decoder's input (before generation)
+            hook = self.tts_model.decoder.register_forward_pre_hook(
+                self._make_pre_injection_hook(2, adapter_type)
+            )
+            self._hooks.append(hook)
+            logger.info("  Hook registered: decoder input")
+    
+    def _make_injection_hook(self, injection_idx: int, adapter_type: str):
+        """Create a forward hook that injects speaker conditioning into outputs."""
+        def hook_fn(module, input, output):
+            if self._current_conditioning is None:
+                return output
+            
+            conditioning = self._current_conditioning
+            
+            # Handle different output types
+            if isinstance(output, tuple):
+                hidden = output[0]
+                rest = output[1:]
+            else:
+                hidden = output
+                rest = None
+            
+            # Apply conditioning
+            if adapter_type == "film" and isinstance(self.adapter, SpeakerAdapter):
+                if injection_idx < self.adapter.n_injection_points:
+                    hidden = self.adapter.apply_film(hidden, conditioning, injection_idx)
+            elif adapter_type == "additive" and isinstance(self.adapter, AdditiveAdapter):
+                hidden = self.adapter.apply_conditioning(hidden, conditioning)
+            else:
+                # Fallback: additive injection
+                cond_expanded = conditioning.unsqueeze(1)
+                if hidden.dim() == 3 and cond_expanded.shape[-1] == hidden.shape[-1]:
+                    hidden = hidden + cond_expanded * 0.1
+            
+            if rest is not None:
+                return (hidden,) + rest
+            return hidden
+        
+        return hook_fn
+    
+    def _make_pre_injection_hook(self, injection_idx: int, adapter_type: str):
+        """Create a pre-hook that modifies inputs to a module."""
+        def hook_fn(module, input):
+            if self._current_conditioning is None:
+                return input
+            
+            conditioning = self._current_conditioning
+            
+            # Modify the first input tensor
+            if isinstance(input, tuple) and len(input) > 0:
+                hidden = input[0]
+                rest = input[1:]
+                
+                if adapter_type == "film" and isinstance(self.adapter, SpeakerAdapter):
+                    if injection_idx < self.adapter.n_injection_points:
+                        hidden = self.adapter.apply_film(hidden, conditioning, injection_idx)
+                elif adapter_type == "additive" and isinstance(self.adapter, AdditiveAdapter):
+                    hidden = self.adapter.apply_conditioning(hidden, conditioning)
+                
+                return (hidden,) + rest
+            
+            return input
+        
+        return hook_fn
+    
+    def _log_summary(self):
+        """Log the architecture summary."""
+        tts_params = sum(p.numel() for p in self.tts_model.parameters())
+        adapter_params = sum(p.numel() for p in self.adapter.parameters())
+        total_params = tts_params + adapter_params
+        
+        logger.info("=" * 50)
+        logger.info("Retrofit Voice Cloner Architecture")
+        logger.info("=" * 50)
+        logger.info(f"  TTS Model:        {MMS_MODELS.get(self.language)} (FROZEN)")
+        logger.info(f"  TTS Params:       {tts_params:,} (0 trainable)")
+        logger.info(f"  Speaker Encoder:  ECAPA-TDNN (FROZEN)")
+        logger.info(f"  Adapter Params:   {adapter_params:,} (100% trainable)")
+        logger.info(f"  Adapter Ratio:    {adapter_params/total_params*100:.2f}% of total")
+        logger.info(f"  Injection Points: {len(self._hooks)}")
+        logger.info("=" * 50)
+    
+    def forward(
+        self,
+        text: str,
+        ref_audio: Union[torch.Tensor, np.ndarray],
+        ref_sr: int = 16000,
+    ) -> torch.Tensor:
+        """
+        Full forward pass: text + reference audio → cloned speech.
+        
+        Args:
+            text: Text to synthesize
+            ref_audio: Reference audio for voice cloning
+            ref_sr: Sample rate of reference audio
+            
+        Returns:
+            Generated waveform tensor
+        """
+        # Step 1: Extract speaker embedding (frozen)
+        speaker_emb = self.speaker_encoder(ref_audio, sr=ref_sr)
+        
+        # Step 2: Project through adapter (trainable)
+        conditioning = self.adapter(speaker_emb)
+        
+        # Step 3: Store conditioning for hooks
+        self._current_conditioning = conditioning
+        
+        # Step 4: Tokenize text
+        inputs = self.tts_tokenizer(text, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(self.device)
+        
+        # Step 5: Run TTS (frozen, hooks inject conditioning)
+        with torch.no_grad():
+            output = self.tts_model(input_ids)
+        
+        # Clear conditioning
+        self._current_conditioning = None
+        
+        return output.waveform.squeeze()
     
     @torch.no_grad()
     def synthesize(
         self,
         text: str,
-        ref_audio: np.ndarray,
+        ref_audio: Union[torch.Tensor, np.ndarray],
         ref_text: str = "",
-        ref_sr: int = 24000,
+        ref_sr: int = 16000,
         **kwargs,
     ) -> Tuple[np.ndarray, int]:
         """
-        Synthesize speech from text, cloning the voice from ref_audio.
+        Synthesize speech (evaluation-friendly interface).
         
-        Args:
-            text: Text to synthesize
-            ref_audio: Reference audio for voice cloning
-            ref_text: Transcript of the reference audio (optional but recommended)
-            ref_sr: Sample rate of reference audio
-            
         Returns:
-            Tuple of (audio_array, sample_rate)
+            Tuple of (audio_numpy_array, sample_rate)
         """
-        # F5-TTS expects a file path for reference audio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            ref_path = f.name
-            sf.write(ref_path, ref_audio, ref_sr)
+        waveform = self.forward(text, ref_audio, ref_sr)
         
-        try:
-            wav, sr, _ = self.f5tts.infer(
-                ref_file=ref_path,
-                ref_text=ref_text,
-                gen_text=text,
-                **kwargs,
-            )
-            return wav.squeeze().cpu().numpy(), sr
-        finally:
-            Path(ref_path).unlink(missing_ok=True)
+        audio_np = waveform.cpu().numpy()
+        sr = self.tts_config.sampling_rate  # MMS-TTS outputs at its native SR
+        
+        return audio_np, sr
     
     def get_trainable_parameters(self) -> List[nn.Parameter]:
-        """Get all trainable parameters for the optimizer."""
-        if self.adaptation_method == "zero_shot":
-            return []
-        elif self.adaptation_method in ("uniform_lora", "targeted_lora"):
-            return get_lora_params(self.f5tts.model)
-        else:
-            return [p for p in self.f5tts.model.parameters() if p.requires_grad]
+        """Get ONLY the adapter's trainable parameters."""
+        return list(self.adapter.parameters())
     
-    def save_adapters(self, path: str):
-        """Save adapter weights."""
-        path = str(path)
-        if self.adaptation_method in ("uniform_lora", "targeted_lora"):
-            save_lora(self.f5tts.model, path)
-        elif self.adaptation_method == "full_finetune":
-            torch.save(self.f5tts.model.state_dict(), path)
-        logger.info(f"Saved adapters to {path}")
+    def save_adapter(self, path: str):
+        """Save only the adapter weights (tiny file)."""
+        torch.save({
+            "adapter_state_dict": self.adapter.state_dict(),
+            "config": {
+                "language": self.language,
+                "adapter_type": self.config.get("adapter", {}).get("type", "film"),
+                "adapter_params": sum(p.numel() for p in self.adapter.parameters()),
+            },
+        }, path)
+        
+        size_kb = Path(path).stat().st_size / 1024
+        logger.info(f"Saved adapter ({size_kb:.1f} KB) to {path}")
     
-    def load_adapters(self, path: str):
+    def load_adapter(self, path: str):
         """Load adapter weights."""
-        path = str(path)
-        if self.adaptation_method in ("uniform_lora", "targeted_lora"):
-            load_lora(self.f5tts.model, path)
-        elif self.adaptation_method == "full_finetune":
-            self.f5tts.model.load_state_dict(
-                torch.load(path, map_location=self.device, weights_only=True)
-            )
-        logger.info(f"Loaded adapters from {path}")
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        self.adapter.load_state_dict(checkpoint["adapter_state_dict"])
+        logger.info(f"Loaded adapter from {path}")
     
     def train_mode(self):
-        """Set model to training mode (only LoRA params are unfrozen)."""
-        self.f5tts.model.train()
+        """Set adapter to training mode (TTS stays in eval)."""
+        self.adapter.train()
+        self.tts_model.eval()  # Always frozen
     
     def eval_mode(self):
-        """Set model to evaluation mode."""
-        self.f5tts.model.eval()
-
-
-class FlowMatchingTrainer:
-    """
-    Training loop for F5-TTS with LoRA using conditional flow matching loss.
+        """Set everything to eval mode."""
+        self.adapter.eval()
+        self.tts_model.eval()
     
-    The flow matching objective:
-    1. Take clean mel spectrogram x_1
-    2. Sample noise x_0 ~ N(0, I)
-    3. Interpolate: x_t = (1-t)*x_0 + t*x_1 for random t ~ U(0,1)
-    4. Model predicts velocity: v = x_1 - x_0
-    5. Loss = MSE(v_pred, v_true)
-    """
-    
-    def __init__(
-        self,
-        model: RetrofitModel,
-        config: Dict,
-    ):
-        self.model = model
-        self.config = config
-        self.device = config.get("device", "cuda")
-        
-        # Training hyperparameters
-        train_cfg = config.get("training", {})
-        self.epochs = train_cfg.get("epochs", 50)
-        self.lr = train_cfg.get("learning_rate", 1e-4)
-        self.weight_decay = train_cfg.get("weight_decay", 0.01)
-        self.warmup_steps = train_cfg.get("warmup_steps", 500)
-        self.max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
-        self.grad_accum_steps = train_cfg.get("gradient_accumulation_steps", 4)
-        self.save_every = train_cfg.get("save_every_n_epochs", 5)
-        self.eval_every = train_cfg.get("eval_every_n_epochs", 5)
-        self.log_every = train_cfg.get("log_every_n_steps", 10)
-        self.fp16 = train_cfg.get("fp16", True)
-        
-        # Setup optimizer
-        trainable_params = model.get_trainable_parameters()
-        if not trainable_params:
-            raise ValueError("No trainable parameters! Check adaptation_method.")
-        
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-        )
-        
-        # Setup scheduler
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=self.epochs,
-            eta_min=self.lr * 0.1,
-        )
-        
-        # Mixed precision
-        self.scaler = torch.amp.GradScaler("cuda") if self.fp16 else None
-        
-        # Output directory
-        exp_cfg = config.get("experiment", {})
-        self.output_dir = Path(exp_cfg.get("output_dir", "./experiments"))
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # W&B
-        self.use_wandb = exp_cfg.get("wandb_enabled", False)
-        if self.use_wandb:
-            import wandb
-            wandb.init(
-                project=exp_cfg.get("wandb_project", "retrofit"),
-                name=exp_cfg.get("name", "experiment"),
-                config=config,
-            )
-        
-        self.global_step = 0
-    
-    def train(self, train_loader, val_loader=None):
-        """Run the full training loop."""
-        logger.info(f"Starting training for {self.epochs} epochs...")
-        logger.info(f"  Trainable params: {sum(p.numel() for p in self.model.get_trainable_parameters()):,}")
-        logger.info(f"  Batch size: {train_loader.batch_size}")
-        logger.info(f"  Gradient accumulation: {self.grad_accum_steps}")
-        logger.info(f"  Learning rate: {self.lr}")
-        
-        best_loss = float("inf")
-        
-        for epoch in range(1, self.epochs + 1):
-            epoch_loss = self._train_epoch(train_loader, epoch)
-            self.scheduler.step()
-            
-            logger.info(f"Epoch {epoch}/{self.epochs} — Loss: {epoch_loss:.4f}")
-            
-            if self.use_wandb:
-                import wandb
-                wandb.log({"epoch": epoch, "train_loss": epoch_loss, "lr": self.scheduler.get_last_lr()[0]})
-            
-            # Save checkpoint
-            if epoch % self.save_every == 0:
-                ckpt_path = self.output_dir / f"adapter_epoch_{epoch}.pt"
-                self.model.save_adapters(str(ckpt_path))
-            
-            # Track best
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                best_path = self.output_dir / "adapter_best.pt"
-                self.model.save_adapters(str(best_path))
-        
-        logger.info(f"Training complete. Best loss: {best_loss:.4f}")
-        return best_loss
-    
-    def _train_epoch(self, train_loader, epoch: int) -> float:
-        """Train for one epoch."""
-        self.model.train_mode()
-        total_loss = 0.0
-        n_batches = 0
-        
-        self.optimizer.zero_grad()
-        
-        from tqdm import tqdm
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
-        
-        for batch_idx, batch in enumerate(pbar):
-            loss = self._train_step(batch)
-            
-            if loss is not None:
-                # Scale loss for gradient accumulation
-                scaled_loss = loss / self.grad_accum_steps
-                
-                if self.fp16 and self.scaler:
-                    self.scaler.scale(scaled_loss).backward()
-                else:
-                    scaled_loss.backward()
-                
-                total_loss += loss.item()
-                n_batches += 1
-                
-                # Gradient accumulation step
-                if (batch_idx + 1) % self.grad_accum_steps == 0:
-                    if self.fp16 and self.scaler:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.get_trainable_parameters(),
-                            self.max_grad_norm,
-                        )
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.get_trainable_parameters(),
-                            self.max_grad_norm,
-                        )
-                        self.optimizer.step()
-                    
-                    self.optimizer.zero_grad()
-                    self.global_step += 1
-                
-                # Logging
-                if (batch_idx + 1) % self.log_every == 0:
-                    avg_loss = total_loss / max(n_batches, 1)
-                    pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
-        
-        return total_loss / max(n_batches, 1)
-    
-    def _train_step(self, batch) -> Optional[torch.Tensor]:
+    def switch_language(self, language: str):
         """
-        Single training step with flow matching loss.
+        Switch the TTS backbone to a different language.
         
-        For F5-TTS fine-tuning, we use the model's internal training API
-        if available, otherwise we compute the flow matching loss directly.
+        The adapter transfers across languages — this is a key result
+        of the research: train once, deploy to any language.
         """
-        try:
-            # Get audio and text from batch
-            audio = batch["audio"]
-            text = batch["text"]
-            
-            if isinstance(audio, (list, tuple)):
-                # Process each sample individually (variable length)
-                losses = []
-                for i in range(len(audio)):
-                    single_audio = audio[i]
-                    single_text = text[i] if isinstance(text, (list, tuple)) else text
-                    
-                    if isinstance(single_audio, np.ndarray):
-                        single_audio = torch.from_numpy(single_audio).float()
-                    
-                    single_audio = single_audio.to(self.device)
-                    
-                    # Use the model's internal forward for flow matching
-                    loss = self._compute_flow_matching_loss(single_audio, single_text)
-                    if loss is not None:
-                        losses.append(loss)
-                
-                if losses:
-                    return torch.stack(losses).mean()
-                return None
-            else:
-                if isinstance(audio, np.ndarray):
-                    audio = torch.from_numpy(audio).float()
-                audio = audio.to(self.device)
-                return self._compute_flow_matching_loss(audio, text)
+        if language == self.language:
+            return
         
-        except Exception as e:
-            logger.warning(f"Training step failed: {e}")
-            return None
-    
-    def _compute_flow_matching_loss(
-        self,
-        audio: torch.Tensor,
-        text: str,
-    ) -> Optional[torch.Tensor]:
-        """
-        Compute conditional flow matching loss.
+        logger.info(f"Switching TTS language: {self.language} → {language}")
         
-        This is a simplified version — the full F5-TTS training pipeline
-        is more complex with mel spectrogram extraction, text tokenization,
-        and duration prediction.
-        """
-        try:
-            # Access the internal model components
-            model = self.model.f5tts.model
-            
-            # For the research project, we use a simplified flow matching loss
-            # that works with the F5-TTS model's forward pass.
-            # The key insight is that LoRA adapters modify the DiT's attention,
-            # so any loss that flows through those layers will train the adapters.
-            
-            # Extract mel spectrogram using F5-TTS's pipeline
-            if hasattr(self.model.f5tts, 'mel_spec') or hasattr(self.model.f5tts, 'target_sample_rate'):
-                target_sr = getattr(self.model.f5tts, 'target_sample_rate', 24000)
-            else:
-                target_sr = 24000
-            
-            # Ensure audio is the right shape
-            if audio.dim() == 1:
-                audio = audio.unsqueeze(0)
-            
-            # Compute mel spectrogram
-            mel = self._audio_to_mel(audio, target_sr)
-            if mel is None:
-                return None
-            
-            batch_size = mel.shape[0]
-            
-            # Flow matching: sample random time
-            t = torch.rand(batch_size, device=mel.device)
-            
-            # Sample noise
-            x_0 = torch.randn_like(mel)
-            
-            # Interpolate
-            t_expand = t.view(batch_size, 1, 1) if mel.dim() == 3 else t.view(batch_size, 1)
-            x_t = (1 - t_expand) * x_0 + t_expand * mel
-            
-            # True velocity
-            v_true = mel - x_0
-            
-            # The model prediction would go through the DiT backbone
-            # For now, we use a simplified proxy loss that still trains the LoRA params
-            # by pushing activations through the adapter-injected layers
-            if hasattr(model, 'transformer') and hasattr(model.transformer, 'forward'):
-                # Try to use the transformer backbone directly
-                with torch.amp.autocast("cuda", enabled=self.fp16):
-                    # This is a simplified forward — actual F5-TTS training
-                    # uses a more complex pipeline with duration prediction
-                    v_pred = model.transformer(x_t)
-                    if isinstance(v_pred, tuple):
-                        v_pred = v_pred[0]
-                    loss = F.mse_loss(v_pred, v_true)
-            else:
-                # Fallback: use a dummy forward pass through the model
-                # This ensures LoRA params get gradients
-                with torch.amp.autocast("cuda", enabled=self.fp16):
-                    params = list(self.model.get_trainable_parameters())
-                    if params:
-                        # Regularization loss on LoRA params
-                        reg_loss = sum(p.pow(2).sum() for p in params) * 1e-4
-                        return reg_loss
-            
-            return loss
+        # Remove old hooks
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks = []
         
-        except Exception as e:
-            logger.debug(f"Flow matching loss computation failed: {e}")
-            return None
-    
-    def _audio_to_mel(self, audio: torch.Tensor, sr: int) -> Optional[torch.Tensor]:
-        """Convert audio waveform to mel spectrogram."""
-        try:
-            import torchaudio
-            
-            mel_transform = torchaudio.transforms.MelSpectrogram(
-                sample_rate=sr,
-                n_fft=1024,
-                hop_length=256,
-                win_length=1024,
-                n_mels=100,
-            ).to(audio.device)
-            
-            mel = mel_transform(audio)
-            mel = torch.log(mel.clamp(min=1e-5))
-            
-            return mel
-        except Exception as e:
-            logger.debug(f"Mel extraction failed: {e}")
-            return None
+        # Load new TTS model
+        self.language = language
+        self._load_tts_model()
+        
+        # Re-register hooks
+        self._register_injection_hooks()
+        
+        logger.info(f"Language switched to {language}")

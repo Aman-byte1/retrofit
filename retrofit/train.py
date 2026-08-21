@@ -1,28 +1,36 @@
 """
-Training entry point for Retrofit voice cloning experiments.
+Training for the Retrofit Voice Cloner.
+
+Trains ONLY the adapter layers using contrastive speaker learning:
+- Same-speaker pairs → similar conditioning vectors
+- Different-speaker pairs → dissimilar conditioning vectors
+
+This is fast because we DON'T run the TTS model during training.
+The adapter learns to project speaker embeddings into a good
+conditioning space using only the frozen speaker encoder.
 
 Usage:
-    # Zero-shot baseline (no training, just evaluate)
-    python -m retrofit.train --method zero_shot
+    # Train on IWSLT data (French)
+    python -m retrofit.train --language fr --epochs 100
 
-    # Uniform LoRA fine-tuning
-    python -m retrofit.train --method uniform_lora --epochs 50
+    # Train on Common Voice
+    python -m retrofit.train --data-source mozilla-foundation/common_voice_17_0 --language fr
 
-    # Targeted LoRA (after running layer analysis)
-    python -m retrofit.train --method targeted_lora --target-layers 0 1 2 5 8
-
-    # Full fine-tuning baseline (expensive)
-    python -m retrofit.train --method full_finetune --epochs 20
+    # Quick test run
+    python -m retrofit.train --language fr --epochs 5 --max-train-samples 100
 """
 
 import argparse
 import logging
 import sys
+import time
 import yaml
 import torch
+import torch.nn as nn
 import random
 import numpy as np
 from pathlib import Path
+from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,169 +41,317 @@ logger = logging.getLogger("retrofit.train")
 
 
 def set_seed(seed: int):
-    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
-def load_config(config_path: str = "configs/default.yaml") -> dict:
-    """Load configuration from YAML file."""
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
-    return config
+def load_config(path: str = "configs/default.yaml") -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def create_speaker_pairs(dataset, speaker_encoder, device="cuda"):
+    """
+    Pre-compute speaker embeddings for all training samples.
+    
+    Returns a list of (embedding, speaker_id) tuples for contrastive training.
+    """
+    logger.info("Pre-computing speaker embeddings for training data...")
+    
+    embeddings = []
+    speaker_ids = []
+    
+    for i in tqdm(range(len(dataset)), desc="Extracting speaker embeddings"):
+        sample = dataset[i]
+        audio = sample["audio"]
+        spk_id = sample["speaker_id"]
+        
+        if isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio).float()
+        
+        emb = speaker_encoder(audio, sr=24000)  # Returns [1, 192]
+        embeddings.append(emb.cpu())
+        speaker_ids.append(spk_id)
+    
+    embeddings = torch.cat(embeddings, dim=0)  # [N, 192]
+    
+    # Convert speaker_ids to integer labels
+    unique_speakers = sorted(set(speaker_ids))
+    spk_to_idx = {spk: idx for idx, spk in enumerate(unique_speakers)}
+    speaker_labels = torch.tensor([spk_to_idx[s] for s in speaker_ids])
+    
+    logger.info(f"Extracted {len(embeddings)} embeddings from {len(unique_speakers)} speakers")
+    
+    return embeddings, speaker_labels, unique_speakers
+
+
+def train_adapter(
+    adapter: nn.Module,
+    embeddings: torch.Tensor,
+    speaker_labels: torch.Tensor,
+    config: dict,
+    output_dir: Path,
+):
+    """
+    Train the adapter using contrastive speaker loss.
+    
+    Fast training — no TTS model in the loop.
+    Only the adapter MLP + FiLM layers are optimized.
+    """
+    from .adapters import ContrastiveLoss, SpeakerConsistencyLoss
+    
+    train_cfg = config.get("training", {})
+    epochs = train_cfg.get("epochs", 100)
+    batch_size = train_cfg.get("batch_size", 64)
+    lr = train_cfg.get("learning_rate", 1e-3)
+    weight_decay = train_cfg.get("weight_decay", 1e-4)
+    device = config.get("model", {}).get("device", "cuda")
+    
+    # Move data to device
+    embeddings = embeddings.to(device)
+    speaker_labels = speaker_labels.to(device)
+    adapter = adapter.to(device)
+    adapter.train()
+    
+    n_samples = len(embeddings)
+    
+    # Losses
+    contrastive_loss = ContrastiveLoss(temperature=0.07)
+    consistency_loss = SpeakerConsistencyLoss(margin=0.2)
+    
+    # Optimizer (only adapter params)
+    optimizer = torch.optim.AdamW(
+        adapter.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+    
+    # Scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=lr * 0.01
+    )
+    
+    logger.info(f"Training adapter for {epochs} epochs...")
+    logger.info(f"  Samples: {n_samples}, Batch size: {batch_size}")
+    logger.info(f"  Adapter params: {sum(p.numel() for p in adapter.parameters()):,}")
+    logger.info(f"  Learning rate: {lr}")
+    
+    best_loss = float("inf")
+    history = []
+    
+    for epoch in range(1, epochs + 1):
+        # Shuffle
+        perm = torch.randperm(n_samples)
+        epoch_loss = 0.0
+        n_batches = 0
+        
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            idx = perm[start:end]
+            
+            batch_emb = embeddings[idx]       # [B, 192]
+            batch_spk = speaker_labels[idx]    # [B]
+            
+            # Forward through adapter
+            conditioning = adapter(batch_emb)  # [B, output_dim]
+            
+            # Contrastive loss: same speaker → similar, different → dissimilar
+            loss_contra = contrastive_loss(conditioning, batch_spk)
+            
+            # Consistency loss: conditioning should be speaker-discriminative
+            # Create random pairs within the batch
+            if len(idx) > 1:
+                idx_a = torch.randperm(len(idx))
+                idx_b = torch.randperm(len(idx))
+                cond_a = conditioning[idx_a]
+                cond_b = conditioning[idx_b]
+                same = batch_spk[idx_a] == batch_spk[idx_b]
+                loss_consist = consistency_loss(cond_a, cond_b, same)
+            else:
+                loss_consist = torch.tensor(0.0, device=device)
+            
+            # Total loss
+            loss = loss_contra + 0.5 * loss_consist
+            
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            n_batches += 1
+        
+        scheduler.step()
+        avg_loss = epoch_loss / max(n_batches, 1)
+        history.append(avg_loss)
+        
+        # Logging
+        if epoch % 10 == 0 or epoch == 1:
+            logger.info(
+                f"  Epoch {epoch:4d}/{epochs} | Loss: {avg_loss:.4f} | "
+                f"LR: {scheduler.get_last_lr()[0]:.2e}"
+            )
+        
+        # Save best
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save({
+                "adapter_state_dict": adapter.state_dict(),
+                "epoch": epoch,
+                "loss": best_loss,
+            }, output_dir / "adapter_best.pt")
+        
+        # Periodic checkpoint
+        save_every = train_cfg.get("save_every_n_epochs", 25)
+        if epoch % save_every == 0:
+            torch.save({
+                "adapter_state_dict": adapter.state_dict(),
+                "epoch": epoch,
+                "loss": avg_loss,
+            }, output_dir / f"adapter_epoch_{epoch}.pt")
+    
+    logger.info(f"Training complete. Best loss: {best_loss:.4f}")
+    
+    # Save training history
+    import json
+    with open(output_dir / "training_history.json", "w") as f:
+        json.dump({"loss": history, "best_loss": best_loss}, f)
+    
+    return best_loss
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Retrofit: Efficient Voice Cloning Training")
-    parser.add_argument("--config", type=str, default="configs/default.yaml",
-                       help="Path to config file")
-    parser.add_argument("--method", type=str, default="uniform_lora",
-                       choices=["zero_shot", "uniform_lora", "targeted_lora", "full_finetune"],
-                       help="Adaptation method")
-    parser.add_argument("--epochs", type=int, default=None,
-                       help="Override number of training epochs")
-    parser.add_argument("--lr", type=float, default=None,
-                       help="Override learning rate")
-    parser.add_argument("--lora-rank", type=int, default=None,
-                       help="Override LoRA rank")
-    parser.add_argument("--target-layers", type=int, nargs="+", default=None,
-                       help="Layer indices for targeted LoRA")
-    parser.add_argument("--data-source", type=str, default="iwslt",
-                       help="Training data source: 'iwslt', HF dataset name, or 'local:/path'")
-    parser.add_argument("--language", type=str, default="fr",
-                       help="Language for training data")
-    parser.add_argument("--max-train-samples", type=int, default=None,
-                       help="Max training samples")
-    parser.add_argument("--output-dir", type=str, default=None,
-                       help="Override output directory")
-    parser.add_argument("--experiment-name", type=str, default=None,
-                       help="Experiment name for logging")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed")
-    parser.add_argument("--no-eval", action="store_true",
-                       help="Skip post-training evaluation")
+    parser = argparse.ArgumentParser(description="Retrofit: Train Voice Cloning Adapter")
+    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--language", default="fr", help="Language for TTS model")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--data-source", default="iwslt")
+    parser.add_argument("--max-train-samples", type=int, default=None)
+    parser.add_argument("--adapter-type", default="film", choices=["film", "additive"])
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--experiment-name", default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-eval", action="store_true")
     
     args = parser.parse_args()
-    
-    # Load config
     config = load_config(args.config)
     
-    # Apply CLI overrides
-    config["adaptation_method"] = args.method
+    # Apply overrides
+    if args.epochs: config["training"]["epochs"] = args.epochs
+    if args.lr: config["training"]["learning_rate"] = args.lr
+    if args.batch_size: config["training"]["batch_size"] = args.batch_size
+    if args.max_train_samples: config["data"]["max_train_samples"] = args.max_train_samples
+    config["model"]["language"] = args.language
+    config["adapter"] = config.get("adapter", {})
+    config["adapter"]["type"] = args.adapter_type
     
-    if args.epochs is not None:
-        config["training"]["epochs"] = args.epochs
-    if args.lr is not None:
-        config["training"]["learning_rate"] = args.lr
-    if args.lora_rank is not None:
-        config["lora"]["rank"] = args.lora_rank
-    if args.target_layers is not None:
-        config["lora"]["target_layers"] = args.target_layers
-    if args.output_dir is not None:
-        config["experiment"]["output_dir"] = args.output_dir
-    if args.experiment_name is not None:
-        config["experiment"]["name"] = args.experiment_name
-    if args.max_train_samples is not None:
-        config["data"]["max_train_samples"] = args.max_train_samples
-    
-    # Set output directory based on method
-    exp_name = args.experiment_name or f"{args.method}_r{config['lora']['rank']}"
-    output_dir = Path(config["experiment"]["output_dir"]) / exp_name
+    # Setup output
+    exp_name = args.experiment_name or f"retrofit_{args.adapter_type}_{args.language}"
+    output_dir = Path(args.output_dir or config["experiment"]["output_dir"]) / exp_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    config["experiment"]["output_dir"] = str(output_dir)
     
-    # Add file logging
-    file_handler = logging.FileHandler(output_dir / "train.log")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s"))
-    logging.getLogger().addHandler(file_handler)
+    # File logging
+    fh = logging.FileHandler(output_dir / "train.log")
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s"))
+    logging.getLogger().addHandler(fh)
     
-    # Set seed
     set_seed(args.seed)
     
     logger.info("=" * 60)
-    logger.info("Retrofit: Efficient Voice Cloning Training")
+    logger.info("Retrofit: Training Voice Cloning Adapter")
     logger.info("=" * 60)
-    logger.info(f"Method: {args.method}")
+    logger.info(f"Language: {args.language}")
+    logger.info(f"Adapter type: {args.adapter_type}")
     logger.info(f"Output: {output_dir}")
-    logger.info(f"Device: {config['model']['device']}")
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
     
     # Save config
     with open(output_dir / "config.yaml", "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
+        yaml.dump(config, f)
     
-    # ==========================================
-    # 1. Load Model
-    # ==========================================
-    logger.info("Loading model...")
+    # ── Step 1: Build the retrofit model ──
+    logger.info("\n[1/4] Building retrofit model...")
+    from .model import RetrofitVoiceCloner
     
-    model_config = {**config["model"], "lora": config["lora"], "adaptation_method": args.method}
+    model_config = {
+        **config.get("model", {}),
+        "language": args.language,
+        "adapter": config.get("adapter", {}),
+        "speaker_encoder": config.get("speaker_encoder", {}),
+    }
+    model = RetrofitVoiceCloner(model_config)
     
-    from .model import RetrofitModel, FlowMatchingTrainer
-    model = RetrofitModel(model_config)
+    # ── Step 2: Load training data ──
+    logger.info("\n[2/4] Loading training data...")
+    from .data import MultiSpeakerTrainDataset
     
-    if args.method == "zero_shot":
-        logger.info("Zero-shot mode — skipping training, proceeding to evaluation")
-    else:
-        # ==========================================
-        # 2. Load Training Data
-        # ==========================================
-        logger.info("Loading training data...")
-        from .data import create_train_dataloader
-        
-        train_loader = create_train_dataloader(
-            source=args.data_source,
-            language=args.language,
-            batch_size=config["training"]["batch_size"],
-            max_samples=config["data"].get("max_train_samples"),
-            target_sr=config["audio"]["sample_rate"],
-            num_workers=config["training"]["num_workers"],
-            is_train=True,
-        )
-        
-        logger.info(f"Training samples: {len(train_loader.dataset)}")
-        
-        # ==========================================
-        # 3. Train
-        # ==========================================
-        trainer = FlowMatchingTrainer(model, config)
-        best_loss = trainer.train(train_loader)
-        
-        logger.info(f"Training complete. Best loss: {best_loss:.4f}")
+    train_dataset = MultiSpeakerTrainDataset(
+        source=args.data_source,
+        language=args.language,
+        target_sr=config.get("audio", {}).get("sample_rate", 24000),
+        max_samples=config["data"].get("max_train_samples"),
+        is_train=True,
+    )
     
-    # ==========================================
-    # 4. Post-Training Evaluation
-    # ==========================================
+    # ── Step 3: Pre-compute speaker embeddings ──
+    logger.info("\n[3/4] Pre-computing speaker embeddings...")
+    embeddings, speaker_labels, unique_speakers = create_speaker_pairs(
+        train_dataset,
+        model.speaker_encoder,
+        device=config["model"]["device"],
+    )
+    
+    # ── Step 4: Train the adapter ──
+    logger.info("\n[4/4] Training adapter...")
+    start_time = time.time()
+    
+    best_loss = train_adapter(
+        adapter=model.adapter,
+        embeddings=embeddings,
+        speaker_labels=speaker_labels,
+        config=config,
+        output_dir=output_dir,
+    )
+    
+    train_time = time.time() - start_time
+    logger.info(f"\nTraining time: {train_time/60:.1f} minutes")
+    
+    # Save final adapter from the model
+    model.save_adapter(str(output_dir / "adapter_final.pt"))
+    
+    # ── Step 5: Post-training evaluation ──
     if not args.no_eval:
-        logger.info("Running post-training evaluation...")
-        from .evaluate import run_evaluation
+        logger.info("\nRunning post-training evaluation...")
+        model.load_adapter(str(output_dir / "adapter_best.pt"))
         
+        from .evaluate import run_evaluation
         results = run_evaluation(
             model=model,
             config=config,
             output_dir=output_dir,
-            method_name=args.method,
+            method_name=f"retrofit_{args.adapter_type}",
         )
         
-        # Print summary
         logger.info("\n" + "=" * 60)
-        logger.info("EVALUATION RESULTS")
+        logger.info("RESULTS")
         logger.info("=" * 60)
         for lang, stats in results.items():
             logger.info(
                 f"  {lang}: CER={stats['avg_cer']:.3f} | "
-                f"SpeakerSim={stats['avg_speaker_sim']:.3f} | "
+                f"SpkSim={stats['avg_speaker_sim']:.3f} | "
                 f"Combined={stats['avg_combined']:.3f}"
             )
+        
+        # Compare against baseline
+        logger.info(f"\n  Training time: {train_time/60:.1f} min")
+        logger.info(f"  Adapter size: {sum(p.numel() for p in model.adapter.parameters()):,} params")
     
-    logger.info("Done!")
+    logger.info("\nDone! ✓")
 
 
 if __name__ == "__main__":

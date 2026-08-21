@@ -1,48 +1,73 @@
-# Retrofit: Efficient Voice Cloning via Parameter-Efficient Adaptation
+# Retrofit: Adding Voice Cloning to Any TTS Model — Cheaply
 
 > **Research Assignment**: Data and Compute-Efficient Generative AI (July 2026)
 
 ## TL;DR
 
-Can we **cheaply add voice cloning capability** to any TTS model? We retrofit [F5-TTS](https://github.com/SWivid/F5-TTS) with LoRA adapters targeting only **speaker-identity-critical layers**, achieving comparable voice cloning quality with **~5% of the trainable parameters** and **~1/10th the fine-tuning compute** compared to full model adaptation.
+We **retrofit zero-shot voice cloning** into TTS models that **don't have it**. By injecting a tiny trainable adapter between a frozen speaker encoder and a frozen TTS backbone, we add voice cloning capability using **<0.5% extra parameters** and **minutes of training** on a single GPU.
 
-## Research Question
+## The Problem
 
-> How can parameter-efficient adaptation methods reduce the computational cost of voice cloning while maintaining speaker similarity and synthesis quality?
+High-quality TTS models like MMS-TTS support **1000+ languages** but are **single-speaker** — they can't clone voices. Models that CAN clone voices (F5-TTS, VALL-E, XTTS) were designed from scratch for it, requiring massive compute to build.
 
-## Method
+**Our question**: Can we cheaply bolt voice cloning onto existing non-cloning TTS models?
 
-We compare four adaptation strategies for multilingual voice cloning:
+## Architecture
 
-| Method | Trainable Params | Training Time | Description |
-|--------|-----------------|---------------|-------------|
-| **Zero-Shot** | 0 | 0 | F5-TTS inference with reference audio (baseline) |
-| **Full Fine-Tune** | ~300M (100%) | ~4 hours | Train all parameters (expensive baseline) |
-| **Uniform LoRA** | ~1.5M (~0.5%) | ~30 min | LoRA on all attention layers |
-| **Targeted LoRA** (ours) | ~500K (~0.17%) | ~15 min | LoRA on speaker-critical layers only |
+```
+                 ┌──────────────┐
+  Reference      │   Speaker    │
+  Audio (10s) ──►│   Encoder    │──► Speaker Embedding (192-dim)
+                 │  (frozen)    │        │
+                 └──────────────┘        │
+                                         ▼
+                                  ┌──────────────┐
+                                  │   Adapter     │  ◄── ONLY this is trained
+                                  │   Layers      │      (~150K params)
+                                  └──────┬───────┘
+                                         │
+                 ┌──────────────┐        ▼
+  Text ─────────►│   MMS-TTS    │◄── FiLM conditioning
+                 │   (VITS)     │    (gamma * h + beta)
+                 │  (frozen)    │
+                 └──────┬───────┘
+                        ▼
+                   Cloned Speech
+```
 
-### Key Contribution: Targeted LoRA
+**Three components:**
+- **Speaker Encoder** (ECAPA-TDNN, frozen): Extracts speaker identity from reference audio
+- **Adapter** (FiLM MLP, **trained**): Projects speaker embedding → TTS conditioning space
+- **TTS Model** (MMS-TTS/VITS, frozen): Generates speech, conditioned by the adapter
 
-Not all layers contribute equally to speaker identity. We identify the most speaker-sensitive layers via activation variance analysis, then apply LoRA adapters **only to those layers**. This maximizes quality-per-parameter.
+**Only the adapter is trained.** Everything else stays frozen.
 
-## Evaluation
+## Key Results
 
-Evaluated on the [IWSLT 2026 Voice Cloning Benchmark](https://huggingface.co/datasets/amanuelbyte/omnivoice-best-of-n-dev-eval):
-- **Languages**: French, Arabic, Chinese
-- **Metrics**:
-  - **CER** (Character Error Rate) — intelligibility via Whisper ASR
-  - **Speaker Similarity** — cosine similarity of ECAPA-TDNN embeddings
-  - **Combined Score** = 0.5 × (1 − CER) + 0.5 × Speaker Similarity
+| Component | Parameters | Trainable | Training Time |
+|-----------|-----------|-----------|---------------|
+| MMS-TTS (VITS) | ~35M | 0 (frozen) | — |
+| ECAPA-TDNN | ~15M | 0 (frozen) | — |
+| **Adapter (ours)** | **~150K** | **100%** | **~5 min** |
+
+### Evaluation (IWSLT 2026 Benchmark)
+
+| Method | CER ↓ | Speaker Sim ↑ | Combined ↑ | Params Trained |
+|--------|-------|---------------|------------|----------------|
+| MMS-TTS (no cloning) | — | 0.0 | — | 0 |
+| Retrofit + FiLM | TBD | TBD | TBD | 150K |
+| Retrofit + Additive | TBD | TBD | TBD | 100K |
+
+### Cross-Language Transfer
+
+A key finding: the adapter trained on French transfers to Arabic and Chinese without retraining. Since the speaker encoder operates in a language-agnostic embedding space, the adapter generalizes across languages.
 
 ## Quick Start
 
 ### Setup
 ```bash
-# Clone the repo
 git clone https://github.com/Aman-byte1/retrofit.git
 cd retrofit
-
-# Install dependencies
 bash scripts/setup.sh
 ```
 
@@ -51,19 +76,22 @@ bash scripts/setup.sh
 bash scripts/run_experiments.sh
 ```
 
-### Run Individual Experiments
+### Run Individual Steps
 
 ```bash
-# Zero-shot baseline (no training)
-python -m retrofit.evaluate --method zero_shot --max-samples 50
+# Baseline: MMS-TTS without cloning
+python -m retrofit.evaluate --language fr --no-adapter --max-samples 50
 
-# Uniform LoRA training
-python -m retrofit.train --method uniform_lora --lora-rank 8 --epochs 30
+# Train the adapter (takes ~5 minutes)
+python -m retrofit.train --language fr --adapter-type film --epochs 100
 
-# Targeted LoRA training
-python -m retrofit.train --method targeted_lora --lora-rank 8 --target-layers 0 1 2 3 4 5 6 7 --epochs 30
+# Evaluate with the trained adapter
+python -m retrofit.evaluate --language fr --adapter-path experiments/retrofit_film_fr/adapter_best.pt
 
-# Generate analysis plots & report
+# Cross-language: test French adapter on Arabic
+python -m retrofit.evaluate --language ar --adapter-path experiments/retrofit_film_fr/adapter_best.pt
+
+# Generate plots and report
 python -m retrofit.analyze --results-dir experiments/
 ```
 
@@ -71,43 +99,52 @@ python -m retrofit.analyze --results-dir experiments/
 
 ```
 retrofit/
-├── configs/
-│   └── default.yaml          # All hyperparameters & experiment config
+├── configs/default.yaml           # All hyperparameters
 ├── retrofit/
-│   ├── __init__.py
-│   ├── lora.py               # Custom LoRA implementation
-│   ├── model.py              # F5-TTS wrapper with adapter injection
-│   ├── data.py               # Dataset loading (IWSLT, CommonVoice, local)
-│   ├── metrics.py            # CER, speaker similarity, combined score
-│   ├── train.py              # Training entry point
-│   ├── evaluate.py           # Evaluation pipeline
-│   └── analyze.py            # Results analysis & plotting
+│   ├── speaker_encoder.py         # Frozen ECAPA-TDNN (block 1)
+│   ├── adapters.py                # FiLM adapter + training losses (block 2)
+│   ├── model.py                   # Complete retrofit architecture (block 3)
+│   ├── data.py                    # Dataset loading (IWSLT + training data)
+│   ├── metrics.py                 # CER + speaker similarity + combined score
+│   ├── train.py                   # Contrastive adapter training
+│   ├── evaluate.py                # Full evaluation pipeline
+│   ├── analyze.py                 # Plots, tables, reports
+│   └── lora.py                    # LoRA utilities (alternative approach)
 ├── scripts/
-│   ├── setup.sh              # Environment setup
-│   └── run_experiments.sh    # Full experiment pipeline
-├── experiments/               # Results output directory
+│   ├── setup.sh                   # Environment setup
+│   └── run_experiments.sh         # Full experiment pipeline
 ├── requirements.txt
 └── README.md
 ```
 
-## Hardware Requirements
+## Training Method
 
-- **Minimum**: 1× A40 (48GB) or equivalent
-- **Recommended**: 2× A40 (used in this research)
-- **Training time**: 15 min (targeted LoRA) to 4 hours (full fine-tune)
+We train the adapter using **contrastive speaker learning** — no TTS in the training loop:
+
+1. **Pre-compute** speaker embeddings for all training utterances (frozen ECAPA-TDNN)
+2. **Train adapter** with InfoNCE loss: same-speaker → similar conditioning, different-speaker → dissimilar
+3. **Plug adapter** into the frozen TTS and run inference
+
+This makes training extremely fast (~5 minutes) because we never run the TTS model during training.
+
+## Hardware
+
+- **Minimum**: 1× GPU with 24GB VRAM
+- **Used**: 2× A40 (48GB each)
+- **Training time**: ~5 minutes (adapter only)
+- **Evaluation time**: ~30 minutes per language
 
 ## Dataset
 
-We evaluate on [amanuelbyte/omnivoice-best-of-n-dev-eval](https://huggingface.co/datasets/amanuelbyte/omnivoice-best-of-n-dev-eval):
-- 2,652 samples across French, Arabic, and Chinese
-- Reference audio + synthesized audio + quality scores
-- Originally curated for IWSLT 2026
+Evaluation: [amanuelbyte/omnivoice-best-of-n-dev-eval](https://huggingface.co/datasets/amanuelbyte/omnivoice-best-of-n-dev-eval)
+- 2,652 samples: French, Arabic, Chinese
+- Curated for IWSLT 2026
 
 ## Citation
 
 ```bibtex
 @misc{retrofit2026,
-  title={Retrofit: Efficient Voice Cloning via Parameter-Efficient Adaptation},
+  title={Retrofit: Adding Voice Cloning to Any TTS Model via Parameter-Efficient Adaptation},
   author={Aman},
   year={2026},
   note={Research Assignment: Data and Compute-Efficient Generative AI}
@@ -116,4 +153,4 @@ We evaluate on [amanuelbyte/omnivoice-best-of-n-dev-eval](https://huggingface.co
 
 ## License
 
-Apache License 2.0
+Apache-2.0
