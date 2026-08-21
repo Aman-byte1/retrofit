@@ -199,29 +199,41 @@ class RetrofitVoiceCloner(nn.Module):
             
             conditioning = self._current_conditioning
             
-            # Handle different output types
+            # ── Extract the hidden state tensor from various output types ──
+            
+            # Case 1: ModelOutput / dataclass (e.g. VitsTextEncoderOutput)
+            # Has .last_hidden_state attribute
+            if hasattr(output, 'last_hidden_state'):
+                hidden = output.last_hidden_state
+                hidden = self._apply_conditioning(
+                    hidden, conditioning, injection_idx, adapter_type
+                )
+                if hidden is not None:
+                    output.last_hidden_state = hidden
+                return output
+            
+            # Case 2: Tuple of tensors
             if isinstance(output, tuple):
+                if len(output) == 0 or not isinstance(output[0], torch.Tensor):
+                    return output
                 hidden = output[0]
                 rest = output[1:]
-            else:
-                hidden = output
-                rest = None
+                hidden = self._apply_conditioning(
+                    hidden, conditioning, injection_idx, adapter_type
+                )
+                if hidden is not None:
+                    return (hidden,) + rest
+                return output
             
-            # Apply conditioning
-            if adapter_type == "film" and isinstance(self.adapter, SpeakerAdapter):
-                if injection_idx < self.adapter.n_injection_points:
-                    hidden = self.adapter.apply_film(hidden, conditioning, injection_idx)
-            elif adapter_type == "additive" and isinstance(self.adapter, AdditiveAdapter):
-                hidden = self.adapter.apply_conditioning(hidden, conditioning)
-            else:
-                # Fallback: additive injection
-                cond_expanded = conditioning.unsqueeze(1)
-                if hidden.dim() == 3 and cond_expanded.shape[-1] == hidden.shape[-1]:
-                    hidden = hidden + cond_expanded * 0.1
+            # Case 3: Raw tensor
+            if isinstance(output, torch.Tensor):
+                result = self._apply_conditioning(
+                    output, conditioning, injection_idx, adapter_type
+                )
+                return result if result is not None else output
             
-            if rest is not None:
-                return (hidden,) + rest
-            return hidden
+            # Unknown type — skip injection
+            return output
         
         return hook_fn
     
@@ -233,22 +245,53 @@ class RetrofitVoiceCloner(nn.Module):
             
             conditioning = self._current_conditioning
             
-            # Modify the first input tensor
             if isinstance(input, tuple) and len(input) > 0:
-                hidden = input[0]
-                rest = input[1:]
-                
-                if adapter_type == "film" and isinstance(self.adapter, SpeakerAdapter):
-                    if injection_idx < self.adapter.n_injection_points:
-                        hidden = self.adapter.apply_film(hidden, conditioning, injection_idx)
-                elif adapter_type == "additive" and isinstance(self.adapter, AdditiveAdapter):
-                    hidden = self.adapter.apply_conditioning(hidden, conditioning)
-                
-                return (hidden,) + rest
+                first = input[0]
+                if isinstance(first, torch.Tensor):
+                    result = self._apply_conditioning(
+                        first, conditioning, injection_idx, adapter_type
+                    )
+                    if result is not None:
+                        return (result,) + input[1:]
             
             return input
         
         return hook_fn
+    
+    def _apply_conditioning(
+        self,
+        hidden: torch.Tensor,
+        conditioning: torch.Tensor,
+        injection_idx: int,
+        adapter_type: str,
+    ) -> Optional[torch.Tensor]:
+        """
+        Apply speaker conditioning to a hidden state tensor.
+        
+        Returns the conditioned tensor, or None if dimensions don't match.
+        """
+        # Check dimension compatibility
+        # Conditioning is [batch, output_dim], hidden could be [batch, seq, dim] or [batch, dim]
+        cond_dim = conditioning.shape[-1]
+        hidden_dim = hidden.shape[-1]
+        
+        if cond_dim != hidden_dim:
+            # Dimension mismatch — skip this injection point
+            return None
+        
+        try:
+            if adapter_type == "film" and isinstance(self.adapter, SpeakerAdapter):
+                if injection_idx < self.adapter.n_injection_points:
+                    return self.adapter.apply_film(hidden, conditioning, injection_idx)
+            elif adapter_type == "additive" and isinstance(self.adapter, AdditiveAdapter):
+                return self.adapter.apply_conditioning(hidden, conditioning)
+            else:
+                # Fallback: scaled additive
+                cond_expanded = conditioning.unsqueeze(1) if hidden.dim() == 3 else conditioning
+                return hidden + cond_expanded * 0.1
+        except Exception as e:
+            logger.debug(f"Conditioning failed at injection point {injection_idx}: {e}")
+            return None
     
     def _log_summary(self):
         """Log the architecture summary."""
