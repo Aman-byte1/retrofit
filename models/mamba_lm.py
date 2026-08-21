@@ -149,7 +149,7 @@ class MambaBlock(nn.Module):
 
     def _ssm_scan(self, x: torch.Tensor, dt: torch.Tensor, B_ssm: torch.Tensor, C_ssm: torch.Tensor) -> torch.Tensor:
         """
-        Differentiable sequential selective scan in pure PyTorch.
+        Differentiable selective scan in pure PyTorch with parallel discretization.
         x: [B, L, d_inner]
         dt: [B, L, d_inner]
         B_ssm: [B, L, d_state]
@@ -158,28 +158,22 @@ class MambaBlock(nn.Module):
         B, L, D = x.shape
         A = -torch.exp(self.A_log.float())  # [d_inner, d_state]
 
+        # 1. Parallel sequence discretization in 3 GPU operations
+        dA = torch.exp(dt.float().unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))  # [B, L, D, N]
+        dB = dt.float().unsqueeze(-1) * B_ssm.float().unsqueeze(2)              # [B, L, D, N]
+        dB_x = dB * x.float().unsqueeze(-1)                                     # [B, L, D, N]
+        C_f = C_ssm.float().unsqueeze(2)                                        # [B, L, 1, N]
+
+        # 2. Minimal recurrence
         h = torch.zeros(B, D, self.d_state, device=x.device, dtype=torch.float32)
         ys = []
 
         for t in range(L):
-            dt_t = dt[:, t].float()    # [B, d_inner]
-            B_t = B_ssm[:, t].float()  # [B, d_state]
-            C_t = C_ssm[:, t].float()  # [B, d_state]
-            x_t = x[:, t].float()      # [B, d_inner]
+            h = dA[:, t] * h + dB_x[:, t]
+            ys.append((C_f[:, t] * h).sum(-1))
 
-            # Mamba selective-scan discretization:
-            # exponential discretization for A and delta-scaled input B
-            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))     # [B, d_inner, d_state]
-            dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)              # [B, d_inner, d_state]
-
-            # Recurrent state update: h = dA * h + dB * x
-            h = dA * h + dB * x_t.unsqueeze(-1)
-
-            # Output computation: y = C * h + D * x
-            y = (C_t.unsqueeze(1) * h).sum(-1) + self.D.float() * x_t  # [B, d_inner]
-            ys.append(y.to(x.dtype))
-
-        return torch.stack(ys, dim=1)
+        out = torch.stack(ys, dim=1) + self.D.float() * x.float()
+        return out.to(x.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._use_official:
