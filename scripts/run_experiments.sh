@@ -17,6 +17,10 @@ echo "  Architecture: Speaker Encoder → Adapter → Frozen TTS"
 echo "  $(date)"
 echo "============================================================"
 
+# Fix: torchcodec has a broken libnvrtc dependency in this Docker image.
+# Uninstall it so HF datasets falls back to soundfile for audio decoding.
+pip uninstall -y torchcodec 2>/dev/null || true
+
 CONFIG="configs/default.yaml"
 OUTPUT_DIR="experiments"
 MAX_EVAL=50  # Samples per language for eval. Remove limit for full run.
