@@ -7,6 +7,7 @@ Implementation based on:
 
 Uses the official `mamba_ssm` package for the core SSM block.
 Falls back to a pure-PyTorch implementation if mamba_ssm is not available.
+Equipped with QwenRMSNorm for layer normalization.
 """
 
 import math
@@ -15,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-from .transformer_lm import RMSNorm
+from .transformer_lm import QwenRMSNorm
 
 
 class MambaBlock(nn.Module):
@@ -45,14 +46,12 @@ class MambaBlock(nn.Module):
             )
             self._use_official = True
         except ImportError:
-            # Pure PyTorch fallback
             self._build_fallback()
     
     def _build_fallback(self):
         """Build pure-PyTorch selective SSM."""
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False)
         
-        # Depthwise conv
         self.conv1d = nn.Conv1d(
             self.d_inner, self.d_inner,
             kernel_size=self.d_conv,
@@ -61,82 +60,55 @@ class MambaBlock(nn.Module):
             bias=True,
         )
         
-        # SSM parameters
-        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2 + 1, bias=False)  # B, C, dt
-        
-        # Discretization
+        self.x_proj = nn.Linear(self.d_inner, self.d_state * 2 + 1, bias=False)
         self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
         
-        # State matrix A (diagonal, log-parameterized)
         A = torch.arange(1, self.d_state + 1, dtype=torch.float32)
-        self.A_log = nn.Parameter(torch.log(A.repeat(self.d_inner, 1)))  # [d_inner, d_state]
-        
-        # Skip parameter D
+        self.A_log = nn.Parameter(torch.log(A.repeat(self.d_inner, 1)))
         self.D = nn.Parameter(torch.ones(self.d_inner))
-        
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
     
     def _ssm_scan(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Selective scan in pure PyTorch.
-        x: [B, L, d_inner]
-        """
         B, L, D = x.shape
+        x_proj = self.x_proj(x)
+        B_ssm = x_proj[..., :self.d_state]
+        C_ssm = x_proj[..., self.d_state:2*self.d_state]
+        dt = F.softplus(self.dt_proj(x_proj[..., -1:]))
         
-        # Project to get B_ssm, C_ssm, dt
-        x_proj = self.x_proj(x)  # [B, L, d_state*2 + 1]
-        B_ssm = x_proj[..., :self.d_state]  # [B, L, d_state]
-        C_ssm = x_proj[..., self.d_state:2*self.d_state]  # [B, L, d_state]
-        dt = F.softplus(self.dt_proj(x_proj[..., -1:]))  # [B, L, d_inner]
-        
-        # Discretize A
-        A = -torch.exp(self.A_log)  # [d_inner, d_state]
-        
-        # Scan
+        A = -torch.exp(self.A_log)
         h = torch.zeros(B, D, self.d_state, device=x.device, dtype=x.dtype)
         ys = []
         
         for t in range(L):
-            dt_t = dt[:, t]  # [B, d_inner]
-            B_t = B_ssm[:, t]  # [B, d_state]
-            C_t = C_ssm[:, t]  # [B, d_state]
-            x_t = x[:, t]  # [B, d_inner]
+            dt_t = dt[:, t]
+            B_t = B_ssm[:, t]
+            C_t = C_ssm[:, t]
+            x_t = x[:, t]
             
-            # Discretized A and B
-            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))  # [B, d_inner, d_state]
-            dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)  # [B, d_inner, d_state]
+            dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
+            dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)
             
-            # State update: h = dA * h + dB * x
             h = dA * h + dB * x_t.unsqueeze(-1)
-            
-            # Output: y = C * h + D * x
-            y = (C_t.unsqueeze(1) * h).sum(-1)  # [B, d_inner]
+            y = (C_t.unsqueeze(1) * h).sum(-1)
             y = y + self.D * x_t
             ys.append(y)
         
-        return torch.stack(ys, dim=1)  # [B, L, d_inner]
+        return torch.stack(ys, dim=1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._use_official:
             return self.mamba(x)
         
-        # Fallback implementation
         B, L, D = x.shape
-        
-        # Input projection
-        xz = self.in_proj(x)  # [B, L, 2*d_inner]
+        xz = self.in_proj(x)
         x_inner, z = xz.chunk(2, dim=-1)
         
-        # Conv
-        x_inner = x_inner.transpose(1, 2)  # [B, d_inner, L]
-        x_inner = self.conv1d(x_inner)[:, :, :L]  # Trim padding
-        x_inner = x_inner.transpose(1, 2)  # [B, L, d_inner]
+        x_inner = x_inner.transpose(1, 2)
+        x_inner = self.conv1d(x_inner)[:, :, :L]
+        x_inner = x_inner.transpose(1, 2)
         x_inner = F.silu(x_inner)
         
-        # SSM scan
         y = self._ssm_scan(x_inner)
-        
-        # Gate and project
         y = y * F.silu(z)
         return self.out_proj(y)
 
@@ -145,7 +117,7 @@ class MambaLayer(nn.Module):
     """Pre-norm Mamba layer."""
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
-        self.norm = RMSNorm(d_model)
+        self.norm = QwenRMSNorm(d_model)
         self.mamba = MambaBlock(d_model, d_state, d_conv, expand)
     
     def forward(self, x):
@@ -157,13 +129,7 @@ class MambaLM(nn.Module):
     Mamba Language Model.
     
     Architecture: Embedding → N × MambaLayer → RMSNorm → LM Head
-    
-    Key properties:
-    - O(N) linear complexity (no attention)
-    - Constant memory during inference (recurrent state)
-    - Selective state space mechanism for input-dependent dynamics
     """
-    
     ARCH_NAME = "mamba"
     
     def __init__(
@@ -187,16 +153,16 @@ class MambaLM(nn.Module):
             for _ in range(n_layers)
         ])
         
-        self.norm = RMSNorm(d_model)
+        self.norm = QwenRMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
         
         self._init_weights()
     
     def _init_weights(self):
-        for p in self.parameters():
+        for name, p in self.named_parameters():
             if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+                nn.init.normal_(p, mean=0.0, std=0.02)
     
     def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None):
         h = self.drop(self.tok_emb(x))
@@ -225,15 +191,12 @@ class MambaLM(nn.Module):
 
 
 def create_mamba(vocab_size: int, target_params: int = 50_000_000) -> MambaLM:
-    """Create a Mamba LM targeting approximately `target_params` parameters."""
-    # Mamba layer params: ~6*d_model^2 per layer (with expand=2)
-    # ~50M: d=512, 24 layers
-    model = MambaLM(
+    """Create a Mamba LM targeting ~48M-50M parameters."""
+    return MambaLM(
         vocab_size=vocab_size,
         d_model=512,
-        n_layers=24,
+        n_layers=28,
         d_state=16,
         d_conv=4,
         expand=2,
     )
-    return model
