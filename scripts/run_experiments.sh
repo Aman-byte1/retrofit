@@ -135,11 +135,23 @@ done
 # ============================================================
 echo ""
 echo "============================================================"
-echo "[6/6] Generating analysis report and plots"
+echo "[6/7] Generating analysis report and plots"
 echo "============================================================"
 python analyze.py \
     --results-dir $RESULTS_DIR \
     --output-dir $RESULTS_DIR/analysis
+
+# ============================================================
+# Step 7: Upload to Hugging Face Hub
+# ============================================================
+echo ""
+echo "============================================================"
+echo "[7/7] Uploading Models & Benchmark to Hugging Face Hub"
+echo "============================================================"
+python scripts/upload_to_hf.py \
+    --username amanuelbyte \
+    --repo-name amharic-50m-architecture-benchmark \
+    --results-dir $RESULTS_DIR || echo "  HF upload skipped or failed (can run manually: python scripts/upload_to_hf.py)"
 
 echo ""
 echo "============================================================"
@@ -148,5 +160,6 @@ echo "  Results:  ${RESULTS_DIR}/analysis/"
 echo "  Report:   ${RESULTS_DIR}/analysis/report.md"
 echo "  LaTeX:    ${RESULTS_DIR}/analysis/results_table.tex"
 echo "  Plots:    ${RESULTS_DIR}/analysis/*.png"
+echo "  Hugging Face: https://huggingface.co/amanuelbyte/amharic-50m-architecture-benchmark"
 echo "  $(date)"
 echo "============================================================"
