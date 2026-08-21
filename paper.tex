@@ -8,7 +8,6 @@
 \usepackage{booktabs}
 \usepackage{tabularx}
 \usepackage{graphicx}
-\usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage{caption}
 \usepackage{tikz}
@@ -26,26 +25,14 @@
 
 \newtheorem{theorem}{Theorem}
 
-% Hyperlink configuration
-\hypersetup{
-    colorlinks=true,
-    linkcolor=blue!75!black,
-    citecolor=green!50!black,
-    urlcolor=blue!85!black,
-    pdfauthor={Amanuel Byte},
-    pdftitle={Are We Moving in the Right Direction with Transformers? An Empirical Inquiry}
-}
-
 % -----------------------------------------------------------------------------
 % Title and Author Information
 % -----------------------------------------------------------------------------
-\title{\vspace{-0.5in}\textbf{\Large Are We Moving in the Right Direction with Transformers?\\An Empirical Inquiry into Quadratic Attention, Gated Linear DeltaNet, and Hierarchical Recurrence for Low-Resource Semitic Language Modeling}}
+\title{\vspace{-0.5in}\textbf{\Large Are We Moving in the Right Direction with Transformers?}}
 
 \author{
-  \textbf{Amanuel Byte} \\
-  Department of Computer Science \& Artificial Intelligence \\
-  \texttt{https://github.com/Aman-byte1/retrofit} \\
-  \texttt{https://huggingface.co/amanuelbyte/amharic-50m-architecture-benchmark}
+  \textbf{Amanuel Gizachew} \\
+  Department of Computer Science \& Artificial Intelligence
 }
 
 \date{August 2026}
@@ -58,7 +45,7 @@
 \maketitle
 
 \begin{abstract}
-The contemporary natural language processing landscape is largely founded on an implicit consensus: the standard quadratic softmax Transformer is the universal substrate for intelligence. However, as language models scale and diversify across non-Latin, morphologically intricate, and compute-constrained languages, fundamental questions arise: \textit{Are we moving in the right direction with pure quadratic Transformers? Or are we over-allocating compute and memory to quadratic attention at the expense of computational efficiency and accessibility?} In this paper, we investigate this fundamental question through a controlled empirical benchmark at the $50$ million parameter scale ($\sim 50\text{M}$) on Amharic---a non-concatenative Semitic language written in the Ethiopic script ($V = 3,919$). We pretrain from scratch and rigorously evaluate four architectural paradigms under identical optimization on an NVIDIA A100 GPU: (1) Standard/Hybrid Transformer with Qwen3.5-style Gated DeltaNet and Multi-Token Prediction (MTP), (2) Dual-Timescale Hierarchical Recurrent Model (HRM-Text), (3) Selective State Space Models (Mamba), and (4) Hybrid Mamba-Attention. Our empirical findings demonstrate a critical nuance: while **Qwen3.5** achieves the best validation perplexity ($\text{PPL} = 9.25$), **HRM-Text** achieves competitive linguistic convergence ($\text{PPL} = 10.83$) while providing a staggering **$9.4\times$ throughput speedup** ($43,078\text{ tokens/sec}$ vs. $4,565\text{ tokens/sec}$) and **$22.4\times$ memory reduction** ($3.43\text{ GB}$ vs. $76.68\text{ GB}$ peak VRAM). We synthesize these results into an analytical framework exploring whether pure quadratic attention is truly necessary, proposing hybrid linear associative memory and hierarchical recurrence as the sustainable path forward for low-resource global NLP.
+The contemporary natural language processing landscape is largely founded on an implicit consensus: the standard quadratic softmax Transformer is the universal substrate for intelligence. However, as language models scale and diversify across non-Latin, morphologically intricate, and compute-constrained languages, fundamental questions arise: \textit{Are we moving in the right direction with pure quadratic Transformers? Or are we over-allocating compute and memory to quadratic attention at the expense of computational efficiency and accessibility?} In this paper, I investigate this question through a controlled empirical benchmark at the $50$ million parameter scale ($\sim 50\text{M}$) on Amharic---a non-concatenative Semitic language written in the Ethiopic script ($V = 3,919$). I pretrain from scratch and rigorously evaluate four architectural paradigms under identical optimization on an NVIDIA A100 GPU: (1) Standard/Hybrid Transformer with Qwen3.5-style Gated DeltaNet and Multi-Token Prediction (MTP), (2) Dual-Timescale Hierarchical Recurrent Model (HRM-Text), (3) Selective State Space Models (Mamba), and (4) Hybrid Mamba-Attention. My empirical findings demonstrate a critical nuance: while \textbf{Qwen3.5} achieves the best validation perplexity ($\text{PPL} = 9.25$), \textbf{HRM-Text} achieves competitive linguistic convergence ($\text{PPL} = 10.83$) while providing a staggering \textbf{$9.4\times$ throughput speedup} ($43,078\text{ tokens/sec}$ vs. $4,565\text{ tokens/sec}$) and \textbf{$22.4\times$ memory reduction} ($3.43\text{ GB}$ vs. $76.68\text{ GB}$ peak VRAM). I synthesize these results into an analytical framework exploring whether pure quadratic attention is truly necessary, proposing hybrid linear associative memory and hierarchical recurrence as the sustainable path forward for low-resource global NLP.
 \end{abstract}
 
 % -----------------------------------------------------------------------------
@@ -66,7 +53,7 @@ The contemporary natural language processing landscape is largely founded on an 
 \label{sec:intro}
 % -----------------------------------------------------------------------------
 
-Since the seminal introduction of the Transformer architecture \cite{vaswani2017attention}, the deep learning community has treated dense multi-head softmax self-attention as the undisputed foundation of autoregressive sequence modeling. The dominant scaling paradigm \cite{kaplan2020scaling} posits that continuous empirical improvements in loss and downstream generalization can be achieved primarily by scaling parameter counts, dataset tokens, and compute FLOPs within uniform quadratic Transformer blocks.
+Since the introduction of the Transformer architecture \cite{vaswani2017attention}, the deep learning community has treated dense multi-head softmax self-attention as the undisputed foundation of autoregressive sequence modeling. The dominant scaling paradigm \cite{kaplan2020scaling} posits that continuous empirical improvements in loss and downstream generalization can be achieved primarily by scaling parameter counts, dataset tokens, and compute FLOPs within uniform quadratic Transformer blocks.
 
 However, when applied to low-resource, non-Latin, and morphologically complex languages---such as the Semitic languages of East Africa---this standard paradigm encounters severe structural limitations:
 \begin{enumerate}
@@ -75,19 +62,19 @@ However, when applied to low-resource, non-Latin, and morphologically complex la
     \item \textbf{Global Computational Inequity}: The massive VRAM and FLOP demands of dense quadratic attention disproportionately disadvantage researchers, institutions, and edge-device deployments in under-resourced linguistic regions \cite{joshi2020state}.
 \end{enumerate}
 
-These bottlenecks force us to re-examine the core architectural question:
+These bottlenecks force a re-examination of the core architectural question:
 \begin{quote}
 \textit{Are we moving in the right direction with pure quadratic Transformers? If so, what representational qualities make them indispensable? If not, what inductive biases can replace them without sacrificing linguistic expressivity?}
 \end{quote}
 
-To answer this question rigorously, we conduct a controlled empirical study on Amharic, the second most widely spoken Semitic language in the world, featuring rich root-and-pattern non-concatenative morphology written in the Ethiopic syllabary \cite{bender1976language}. We calibrate four distinct model families strictly to $\sim 50\text{M}$ parameters and benchmark their convergence, efficiency, and qualitative generation.
+To answer this question rigorously, I conduct a controlled empirical study on Amharic, the second most widely spoken Semitic language in the world, featuring rich root-and-pattern non-concatenative morphology written in the Ethiopic syllabary \cite{bender1976language}. I calibrate four distinct model families strictly to $\sim 50\text{M}$ parameters and benchmark their convergence, efficiency, and qualitative generation.
 
 % -----------------------------------------------------------------------------
-\section{Architectural Candidates \& Mathematical Inductive Biases}
+\section{Architectural Candidates and Inductive Biases}
 \label{sec:architectures}
 % -----------------------------------------------------------------------------
 
-To dissect the trade-offs between quadratic expressivity and linear efficiency, we evaluate four distinct computational inductive biases at vocabulary size $V = 3,919$:
+To dissect the trade-offs between quadratic expressivity and linear efficiency, I evaluate four distinct computational inductive biases at vocabulary size $V = 3,919$:
 
 \begin{figure*}[t]
 \centering
@@ -174,7 +161,7 @@ Mamba \cite{gu2023mamba} utilizes input-dependent continuous state equations:
 discretized via Zero-Order Hold (ZOH) with timescale $\boldsymbol{\Delta} = \text{softplus}(\mathbf{W}_\Delta \mathbf{x}_t + \mathbf{b}_\Delta)$.
 
 % -----------------------------------------------------------------------------
-\section{Empirical Evaluation \& Experimental Results}
+\section{Empirical Evaluation and Results}
 \label{sec:results}
 % -----------------------------------------------------------------------------
 
@@ -185,16 +172,16 @@ All models are trained from scratch on the curated Amharic Wikipedia corpus ($12
 \small
 \caption{Empirical 50M parameter benchmark on Amharic Wikipedia language modeling.}
 \label{tab:main_results}
-\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccc}
+\begin{tabularx}{\textwidth}{p{3.2cm}ccccccr}
 \toprule
-\textbf{Architecture} & \textbf{Layers} & \textbf{$d_{\text{model}}$} & \textbf{Parameters} & \textbf{Target Error} & \textbf{Speed (tok/s)} & \textbf{Peak VRAM} & \textbf{Train Time} & \textbf{Val PPL ($\downarrow$)} \\
+\textbf{Architecture} & \textbf{Layers} & \textbf{$d_{\text{model}}$} & \textbf{Parameters} & \textbf{Speed} & \textbf{Peak VRAM} & \textbf{Time} & \textbf{Val PPL} \\
 \midrule
-\textbf{Qwen3.5 Transformer} & 14 & 512 & 50,787,592 & +1.58\% & 4,565 & 76.68 GB & 23.4 min & \textbf{9.25} \\
-\textbf{HRM-Text} & 24 & 384 & 49,016,064 & -1.97\% & \textbf{43,078} & \textbf{3.43 GB} & \textbf{2.5 min} & 10.83 \\
-\textbf{Mamba SSM} & 28 & 512 & 49,473,536 & -1.05\% & 216* & 55.99 GB* & --- & 4037.1$^\dagger$ \\
+\textbf{Qwen3.5 Transformer} & 14 & 512 & 50.79M & 4,565 tok/s & 76.68 GB & 23.4 min & \textbf{9.25} \\
+\textbf{HRM-Text} & 24 & 384 & 49.02M & \textbf{43,078 tok/s} & \textbf{3.43 GB} & \textbf{2.5 min} & 10.83 \\
+\textbf{Mamba SSM} & 28 & 512 & 49.47M & 216 tok/s$^{\dagger}$ & 55.99 GB$^{\dagger}$ & --- & 4037.1$^{\ddagger}$ \\
 \bottomrule
-\multicolumn{9}{l}{\footnotesize *Pure PyTorch uncompiled fallback scan. $^\dagger$Zero-shot untrained baseline perplexity.}
-\end{tabular*}
+\multicolumn{8}{l}{\footnotesize $^{\dagger}$Pure PyTorch uncompiled fallback scan. $^{\ddagger}$Zero-shot untrained baseline perplexity.}
+\end{tabularx}
 \end{table*}
 
 \subsection{Quantitative Loss and Pareto Analysis}
@@ -225,7 +212,7 @@ Figure \ref{fig:pareto_frontier} illustrates the Pareto frontier, highlighting t
 
 \begin{figure}[h]
 \centering
-\includegraphics[width=0.9\textwidth]{figures/scaling_comparison.pdf}
+\includegraphics[width=0.88\textwidth]{figures/scaling_comparison.pdf}
 \caption{Theoretical and empirical scaling: (Left) Long-context throughput scaling $O(N)$ vs $O(N^2)$, (Right) Peak memory footprint across context lengths.}
 \label{fig:scaling_comparison}
 \end{figure}
@@ -239,7 +226,7 @@ Table \ref{tab:qualitative_samples} demonstrates autoregressive text completions
 \small
 \caption{Qualitative Amharic text completions ($T=0.8, \text{top-}k=40, \text{top-}p=0.9$).}
 \label{tab:qualitative_samples}
-\begin{tabularx}{\textwidth}{p{3.8cm}X}
+\begin{tabularx}{\textwidth}{p{3.5cm}X}
 \toprule
 \textbf{Prompt} & \textbf{Model Continuation} \\
 \midrule
@@ -250,6 +237,10 @@ Table \ref{tab:qualitative_samples} demonstrates autoregressive text completions
 \textbf{Prompt 2:} \newline {\ethiopicfont አዲስ አበባ የኢትዮጵያ ዋና ከተማ} \newline \footnotesize(Addis Ababa the capital of Ethiopia...) & 
 \textbf{Qwen3.5}: {\ethiopicfont ...ነው። በዚህ አቆጣጠር በ 1979 በኢትዮጵያ እስከ 1991 .ም. ድረስ በኋላ በዝብ ከዚህ መት በኋላ...} \newline
 \textbf{HRM-Text}: {\ethiopicfont ...ነው። በደቡብ በዘመነ ወይም በተሸጠቁ እንደ ዋት የዝብ ከነዚህ ዝብ በማናቸው የኤሎቹ...} \\
+\midrule
+\textbf{Prompt 3:} \newline {\ethiopicfont የሳይንስና የቴክኖሎጂ እድገት ለሀገር} \newline \footnotesize(Advancement of science and tech...) & 
+\textbf{Qwen3.5}: {\ethiopicfont ...ሲያስተዳደግ የኢኮኖሚ እና የማህበራዊ እድገት ከፍተኛ ሚና ይጫወታል።} \newline
+\textbf{HRM-Text}: {\ethiopicfont ...እንዲሁም ከአረሰል አር እንደ ያላቸው ም እስከ በማስተዋ አስተኛ የአማርኛ ምሳሌ ነው።} \\
 \bottomrule
 \end{tabularx}
 \end{table*}
@@ -261,7 +252,7 @@ Both models successfully synthesize grammatically coherent root-pattern template
 \label{sec:discussion}
 % -----------------------------------------------------------------------------
 
-Our empirical findings provide direct, data-driven answers to the central question of this inquiry:
+My empirical findings provide direct, data-driven answers to the central question of this inquiry:
 
 \subsection{Where Transformers are the Right Direction (The Case for Attention)}
 \begin{enumerate}
@@ -277,7 +268,7 @@ Our empirical findings provide direct, data-driven answers to the central questi
 \end{enumerate}
 
 \subsection{The Synthesis: The Path Forward}
-We argue that the future of language modeling is neither pure quadratic Transformers nor pure un-anchored linear models. Rather, the optimal path forward consists of:
+I argue that the future of language modeling is neither pure quadratic Transformers nor pure un-anchored linear models. Rather, the optimal path forward consists of:
 \begin{enumerate}
     \item \textbf{Hybrid Chunk-Parallel Associative Memory (DeltaNet) + Sparse Attention Anchors}: Offering linear inference complexity while retaining quadratic retrieval fidelity.
     \item \textbf{Hierarchical Recurrence (HRM)}: Providing extreme parameter and memory efficiency for compute-bounded and edge-device deployments.
@@ -288,7 +279,7 @@ We argue that the future of language modeling is neither pure quadratic Transfor
 \label{sec:conclusion}
 % -----------------------------------------------------------------------------
 
-We conducted a rigorous, parameter-matched empirical comparison of 50M-class architectures on the low-resource Semitic language Amharic. Our results demonstrate that while Transformer hybrids provide state-of-the-art language modeling accuracy, hierarchical recurrent models establish a new frontier of computational and memory efficiency. We openly release all models, tokenizers, code, and datasets on the Hugging Face Hub.
+I conducted a rigorous, parameter-matched empirical comparison of 50M-class architectures on the low-resource Semitic language Amharic. My results demonstrate that while Transformer hybrids provide state-of-the-art language modeling accuracy, hierarchical recurrent models establish a new frontier of computational and memory efficiency.
 
 % -----------------------------------------------------------------------------
 % Bibliography
@@ -308,7 +299,7 @@ Qwen Team, ``Qwen3.5 Technical Report: Next-Generation Hybrid Models and Multi-T
 S. Yang, B. Wang, Y. Shen, R. Panda, and Y. Kim, ``Gated Delta Networks: Improving Linear Attention with Data-Dependent Decay and Recurrent Updates,'' \textit{International Conference on Learning Representations (ICLR)}, 2024.
 
 \bibitem{wang2026hrm}
-Y. Wang et al. (Sapient Intelligence), ``HRM-Text: Hierarchical Reasoning Models for Scalable Language Pretraining,'' \textit{arXiv:2605.20613}, 2026.
+Y. Wang et al., ``HRM-Text: Hierarchical Reasoning Models for Scalable Language Pretraining,'' \textit{arXiv:2605.20613}, 2026.
 
 \bibitem{gu2023mamba}
 A. Gu and T. Dao, ``Mamba: Linear-Time Sequence Modeling with Selective State Spaces,'' \textit{arXiv:2312.00752}, 2023.
