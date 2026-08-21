@@ -2,7 +2,7 @@
 Generate Amharic text samples from trained model checkpoints.
 
 Loads:
-  • RL-trained Amharic vocabulary (tokenizer/vocab.txt)
+  • RL-trained Amharic vocabulary (tokenizer/vocab.txt) with exact 3,919 tokens
   • Model checkpoint (results/<arch>/best_model.pt or results/<arch>_*/best_model.pt)
   • Prompts with diverse Amharic prefixes
   • Evaluates autoregressive generation quality, latency, and tokens/sec
@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from models import create_model
+from data.prepare_amharic import AmharicRLTokenizer
 
 
 AMHARIC_PROMPTS = [
@@ -30,54 +31,12 @@ AMHARIC_PROMPTS = [
 ]
 
 
-class AmharicTokenizer:
-    """Fast longest-prefix subword tokenizer for Amharic generation."""
-
-    def __init__(self, vocab_file: str):
-        self.token2id = {}
-        self.id2token = {}
-        with open(vocab_file, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
-                token = line.strip()
-                if token:
-                    self.token2id[token] = idx
-                    self.id2token[idx] = token
-
-        self.vocab_size = len(self.token2id)
-        self.max_token_len = max(len(t) for t in self.token2id.keys()) if self.token2id else 1
-        self.tokens_by_len = {}
-        for token, tid in self.token2id.items():
-            self.tokens_by_len.setdefault(len(token), {})[token] = tid
-
-    def encode(self, text: str) -> List[int]:
-        tokens = []
-        i = 0
-        n = len(text)
-        while i < n:
-            matched = False
-            max_check = min(self.max_token_len, n - i)
-            for length in range(max_check, 0, -1):
-                if length in self.tokens_by_len:
-                    sub = text[i : i + length]
-                    if sub in self.tokens_by_len[length]:
-                        tokens.append(self.tokens_by_len[length][sub])
-                        i += length
-                        matched = True
-                        break
-            if not matched:
-                i += 1
-        return tokens
-
-    def decode(self, token_ids: List[int]) -> str:
-        return "".join([self.id2token.get(t, "") for t in token_ids])
-
-
 @torch.no_grad()
 def generate_text(
     model: torch.nn.Module,
-    tokenizer: AmharicTokenizer,
+    tokenizer: AmharicRLTokenizer,
     prompt: str,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 50,
     temperature: float = 0.8,
     top_k: int = 40,
     top_p: float = 0.9,
@@ -87,7 +46,7 @@ def generate_text(
     model.eval()
     prompt_ids = tokenizer.encode(prompt)
     if not prompt_ids:
-        prompt_ids = [0]
+        prompt_ids = [tokenizer.BOS_ID]
 
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     generated_ids = list(prompt_ids)
@@ -95,18 +54,18 @@ def generate_text(
     start_time = time.perf_counter()
 
     for _ in range(max_new_tokens):
-        # Forward pass
+        # Truncate context to 512 if necessary
         if input_ids.shape[1] > 512:
             input_context = input_ids[:, -512:]
         else:
             input_context = input_ids
 
         logits, _ = model(input_context)
-        next_token_logits = logits[:, -1, :] / max(1e-5, temperature)
+        next_token_logits = logits[:, -1, :].float() / max(1e-5, temperature)
 
         # Top-k filtering
         if top_k > 0:
-            indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+            indices_to_remove = next_token_logits < torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))[0][..., -1, None]
             next_token_logits[indices_to_remove] = -float("Inf")
 
         # Top-p (nucleus) filtering
@@ -171,7 +130,7 @@ def run_sample_generation(
     if not os.path.exists(vocab_path):
         raise FileNotFoundError(f"Vocabulary not found at {vocab_path}")
 
-    tokenizer = AmharicTokenizer(vocab_path)
+    tokenizer = AmharicRLTokenizer(vocab_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Generating Amharic samples on {device} (vocab size: {tokenizer.vocab_size:,})...")
 
@@ -193,7 +152,7 @@ def run_sample_generation(
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             state_dict = ckpt.get("model_state", ckpt.get("model", ckpt.get("model_state_dict", ckpt)))
             model.load_state_dict(state_dict, strict=False)
-            print(f"  ✓ Loaded weights successfully.")
+            print(f"  ✓ Loaded weights successfully with exact vocab {tokenizer.vocab_size}.")
         except Exception as e:
             print(f"  ⚠️ Warning loading weights: {e}")
 

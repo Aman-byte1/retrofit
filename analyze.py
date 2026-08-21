@@ -103,57 +103,68 @@ def plot_loss_curves(all_results: Dict, output_dir: str):
     import matplotlib.pyplot as plt
     import matplotlib
     matplotlib.use("Agg")
-    
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
+    has_loss_data = False
+    has_val_data = False
+
     for arch, data in all_results.items():
-        if "step_logs" not in data:
+        if "step_logs" not in data or not data["step_logs"]:
             continue
-        
-        steps = [s["global_step"] for s in data["step_logs"]]
-        losses = [s["loss"] for s in data["step_logs"]]
-        
-        # Smooth loss for plotting
+
+        steps = [s.get("global_step", idx) for idx, s in enumerate(data["step_logs"])]
+        losses = [s.get("base_loss", s.get("objective_loss", s.get("loss", 0.0))) for s in data["step_logs"]]
+        losses = [l for l in losses if l is not None and not np.isnan(l)]
+        if not losses:
+            continue
+
+        has_loss_data = True
         window = max(1, len(losses) // 100)
         if window > 1:
             smoothed = np.convolve(losses, np.ones(window)/window, mode="valid")
             plot_steps = steps[:len(smoothed)]
         else:
             smoothed = losses
-            plot_steps = steps
-        
+            plot_steps = steps[:len(smoothed)]
+
         label = ARCH_LABELS.get(arch, arch)
         color = ARCH_COLORS.get(arch, "#999")
-        
         ax1.plot(plot_steps, smoothed, color=color, label=label, linewidth=2, alpha=0.9)
-    
+
     ax1.set_xlabel("Training Step", fontsize=12, fontweight="bold")
     ax1.set_ylabel("Cross-Entropy Loss", fontsize=12, fontweight="bold")
     ax1.set_title("Training Loss Convergence", fontsize=14, fontweight="bold")
-    ax1.legend(fontsize=11)
+    if has_loss_data:
+        ax1.legend(fontsize=11)
     ax1.grid(True, alpha=0.3)
-    
+
     # Epoch-level val PPL
     for arch, data in all_results.items():
-        if "training" not in data:
+        if "training" not in data or "epoch_logs" not in data["training"]:
             continue
-        
-        epochs = [e["epoch"] + 1 for e in data["training"]["epoch_logs"]]
-        val_ppls = [e["val_perplexity"] for e in data["training"]["epoch_logs"]]
-        
+
+        epoch_logs = data["training"]["epoch_logs"]
+        epochs = [e.get("epoch", idx) + 1 for idx, e in enumerate(epoch_logs)]
+        val_ppls = [e.get("perplexity", e.get("val_perplexity", 0.0)) for e in epoch_logs]
+
+        if not val_ppls or all(p == 0 for p in val_ppls):
+            continue
+
+        has_val_data = True
         label = ARCH_LABELS.get(arch, arch)
         color = ARCH_COLORS.get(arch, "#999")
         marker = ARCH_MARKERS.get(arch, "o")
-        
+
         ax2.plot(epochs, val_ppls, color=color, label=label, linewidth=2,
                 marker=marker, markersize=8, alpha=0.9)
-    
+
     ax2.set_xlabel("Epoch", fontsize=12, fontweight="bold")
     ax2.set_ylabel("Validation Perplexity ↓", fontsize=12, fontweight="bold")
     ax2.set_title("Validation Perplexity (Lower = Better)", fontsize=14, fontweight="bold")
-    ax2.legend(fontsize=11)
+    if has_val_data:
+        ax2.legend(fontsize=11)
     ax2.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     save_path = os.path.join(output_dir, "loss_curves.png")
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -166,53 +177,55 @@ def plot_throughput_scaling(all_results: Dict, output_dir: str):
     import matplotlib.pyplot as plt
     import matplotlib
     matplotlib.use("Agg")
-    
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    
+    has_data = False
+
     for arch, data in all_results.items():
         if "benchmark" not in data:
             continue
-        
+
         bench = data["benchmark"]
         label = ARCH_LABELS.get(arch, arch)
         color = ARCH_COLORS.get(arch, "#999")
         marker = ARCH_MARKERS.get(arch, "o")
-        
-        # Batch throughput
+
         for key in ["batch_throughput", "single_throughput"]:
             if key not in bench:
                 continue
-            
+
             results = [r for r in bench[key] if r.get("status") == "success"]
             if not results:
                 continue
-            
+
+            has_data = True
             seq_lens = [r["seq_len"] for r in results]
             tps = [r["tokens_per_sec"] for r in results]
             vram = [r["peak_vram_mb"] for r in results]
-            
-            ax_target = ax1 if key == "batch_throughput" else ax1
-            ax_target.plot(seq_lens, tps, color=color, label=label if key == "batch_throughput" else None,
-                          linewidth=2, marker=marker, markersize=8, alpha=0.9)
-            
+
+            ax1.plot(seq_lens, tps, color=color, label=label if key == "batch_throughput" else None,
+                    linewidth=2, marker=marker, markersize=8, alpha=0.9)
+
             ax2.plot(seq_lens, vram, color=color, label=label if key == "batch_throughput" else None,
                     linewidth=2, marker=marker, markersize=8, alpha=0.9,
                     linestyle="--" if key == "single_throughput" else "-")
-    
+
     ax1.set_xlabel("Sequence Length", fontsize=12, fontweight="bold")
     ax1.set_ylabel("Throughput (tokens/sec) ↑", fontsize=12, fontweight="bold")
     ax1.set_title("Inference Throughput Scaling", fontsize=14, fontweight="bold")
-    ax1.legend(fontsize=11)
+    if has_data:
+        ax1.legend(fontsize=11)
     ax1.grid(True, alpha=0.3)
     ax1.set_xscale("log", base=2)
-    
+
     ax2.set_xlabel("Sequence Length", fontsize=12, fontweight="bold")
     ax2.set_ylabel("Peak VRAM (MB) ↓", fontsize=12, fontweight="bold")
     ax2.set_title("Memory Scaling (Peak VRAM)", fontsize=14, fontweight="bold")
-    ax2.legend(fontsize=11)
+    if has_data:
+        ax2.legend(fontsize=11)
     ax2.grid(True, alpha=0.3)
     ax2.set_xscale("log", base=2)
-    
+
     plt.tight_layout()
     save_path = os.path.join(output_dir, "throughput_scaling.png")
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
@@ -225,31 +238,34 @@ def plot_pareto(all_results: Dict, output_dir: str):
     import matplotlib.pyplot as plt
     import matplotlib
     matplotlib.use("Agg")
-    
+
     fig, ax = plt.subplots(figsize=(10, 7))
-    
+    has_points = False
+
     for arch, data in all_results.items():
-        if "training" not in data or "benchmark" not in data:
-            continue
-        
-        ppl = data["training"]["best_val_perplexity"]
-        
-        # Get throughput at seq_len=512
-        bench = data["benchmark"].get("batch_throughput", [])
+        t = data.get("training", {})
+        ppl = t.get("best_val_ppl", t.get("best_val_perplexity", t.get("final_val_ppl", 0.0)))
+        params = t.get("total_params", t.get("metadata", {}).get("total_params", 50_000_000))
+
         tps_512 = 0
-        for r in bench:
-            if r.get("seq_len") == 512 and r.get("status") == "success":
-                tps_512 = r["tokens_per_sec"]
-                break
-        
-        if tps_512 == 0:
+        if "benchmark" in data:
+            bench = data["benchmark"].get("batch_throughput", [])
+            for r in bench:
+                if r.get("seq_len") == 512 and r.get("status") == "success":
+                    tps_512 = r["tokens_per_sec"]
+                    break
+
+        if tps_512 == 0 and t.get("epoch_logs"):
+            tps_512 = t["epoch_logs"][-1].get("avg_tokens_per_sec", 0.0)
+
+        if tps_512 == 0 or ppl == 0:
             continue
-        
-        params = data["training"]["metadata"]["total_params"]
+
+        has_points = True
         label = ARCH_LABELS.get(arch, arch)
         color = ARCH_COLORS.get(arch, "#999")
         marker = ARCH_MARKERS.get(arch, "o")
-        
+
         ax.scatter(tps_512, ppl, s=300, c=color, marker=marker,
                   edgecolors="black", linewidth=1.5, zorder=5)
         ax.annotate(
@@ -260,13 +276,14 @@ def plot_pareto(all_results: Dict, output_dir: str):
             fontsize=10,
             fontweight="bold",
         )
-    
+
     ax.set_xlabel("Throughput at seq_len=512 (tokens/sec) →", fontsize=12, fontweight="bold")
     ax.set_ylabel("Validation Perplexity ↓", fontsize=12, fontweight="bold")
     ax.set_title("Quality-Efficiency Pareto Frontier\n(Lower-Right = Better)", fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3)
-    ax.invert_yaxis()
-    
+    if has_points:
+        ax.invert_yaxis()
+
     plt.tight_layout()
     save_path = os.path.join(output_dir, "pareto_frontier.png")
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
