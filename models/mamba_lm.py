@@ -9,13 +9,15 @@ Features:
   • Official `mamba_ssm` backend with high-performance CUDA fused selective scan
   • Mathematically faithful pure-PyTorch fallback with exact dt_rank = ceil(d_model / 16)
   • Specialized Mamba initialization (dt_proj log-spaced inverse softplus, S4D A_log)
+  • Output projection depth-scaling (1 / sqrt(n_layers)) supporting both backends
   • Protection of A_log and D parameters from weight decay (_no_weight_decay = True)
   • Self-contained RMSNorm (eps=1e-5)
+  • Robust loss calculation and analytical parameter estimation
   • Dynamic near-target configuration search (~50M parameters across any vocab)
 """
 
 import math
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -60,14 +62,19 @@ class MambaBlock(nn.Module):
         backend: str = "auto",
     ):
         super().__init__()
+        if backend not in {"auto", "official", "torch"}:
+            raise ValueError(f"backend must be 'auto', 'official', or 'torch', got {backend!r}")
+
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand
         self.d_inner = d_model * expand
-        self.dt_rank = dt_rank or math.ceil(d_model / 16)
-        self.backend = backend
+        self.dt_rank = math.ceil(d_model / 16) if dt_rank is None else dt_rank
+        if self.dt_rank <= 0:
+            raise ValueError(f"dt_rank must be positive, got {self.dt_rank}")
 
+        self.backend = backend
         self._use_official = False
 
         if backend in {"auto", "official"}:
@@ -92,7 +99,7 @@ class MambaBlock(nn.Module):
         """Build exact pure-PyTorch selective SSM with official Mamba parameterization."""
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False)
 
-        # Depthwise 1D causal convolution
+        # Depthwise 1D causal convolution (with bias)
         self.conv1d = nn.Conv1d(
             self.d_inner,
             self.d_inner,
@@ -105,7 +112,7 @@ class MambaBlock(nn.Module):
         # Selective projection: projects to (dt_rank + 2 * d_state)
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * self.d_state, bias=False)
 
-        # Time-step delta projection: dt_rank -> d_inner
+        # Time-step delta projection: dt_rank -> d_inner (with bias)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
 
         # Specialized dt_proj initialization
@@ -152,7 +159,8 @@ class MambaBlock(nn.Module):
             C_t = C_ssm[:, t].float()  # [B, d_state]
             x_t = x[:, t].float()      # [B, d_inner]
 
-            # Discretize continuous matrices A and B using zero-order hold (ZOH)
+            # Mamba selective-scan discretization:
+            # exponential discretization for A and delta-scaled input B
             dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))     # [B, d_inner, d_state]
             dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)              # [B, d_inner, d_state]
 
@@ -248,12 +256,19 @@ class MambaLM(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize embedding properly without destroying Mamba internal state matrix init."""
+        """
+        Initialize embedding properly and depth-scale output projections.
+        Preserves Mamba's specialized A_log and dt_proj initialization.
+        """
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
-        # Rescale out_proj weights by 1 / sqrt(2 * n_layers) for residual stability
-        for layer in self.layers:
-            if hasattr(layer.mamba, "out_proj"):
-                nn.init.normal_(layer.mamba.out_proj.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.n_layers))
+
+        with torch.no_grad():
+            for layer in self.layers:
+                block = layer.mamba
+                # Official backend stores the real mixer one level deeper
+                mixer = block.mamba if block._use_official else block
+                if hasattr(mixer, "out_proj") and hasattr(mixer.out_proj, "weight"):
+                    mixer.out_proj.weight.div_(math.sqrt(self.n_layers))
 
     def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None):
         h = self.drop(self.tok_emb(x))
@@ -266,11 +281,16 @@ class MambaLM(nn.Module):
 
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                targets.reshape(-1),
+            flat_logits = logits.float().reshape(-1, logits.size(-1))
+            flat_targets = targets.reshape(-1)
+            loss_sum = F.cross_entropy(
+                flat_logits,
+                flat_targets,
                 ignore_index=IGNORE_INDEX,
+                reduction="sum",
             )
+            valid_tokens = (flat_targets != IGNORE_INDEX).sum()
+            loss = loss_sum / valid_tokens.clamp_min(1)
 
         return logits, loss
 
@@ -281,23 +301,61 @@ class MambaLM(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def estimate_mamba_parameters(vocab_size: int, d_model: int, n_layers: int, expand: int = 2, d_state: int = 16, d_conv: int = 4) -> int:
-    """Analytical parameter count for Mamba with tied embeddings."""
+def configure_optimizer(
+    model: nn.Module,
+    lr: float = 3e-4,
+    weight_decay: float = 0.1,
+    betas: Tuple[float, float] = (0.9, 0.95),
+) -> torch.optim.AdamW:
+    """Build AdamW optimizer respecting Mamba's _no_weight_decay attributes."""
+    decay = []
+    no_decay = []
+
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        if getattr(p, "_no_weight_decay", False) or p.ndim < 2:
+            no_decay.append(p)
+        else:
+            decay.append(p)
+
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=lr,
+        betas=betas,
+    )
+
+
+def estimate_mamba_parameters(
+    vocab_size: int,
+    d_model: int,
+    n_layers: int,
+    expand: int = 2,
+    d_state: int = 16,
+    d_conv: int = 4,
+) -> int:
+    """Analytical parameter count for Mamba with tied embeddings and conv bias."""
     d_inner = d_model * expand
     dt_rank = math.ceil(d_model / 16)
-    
-    in_proj = d_model * (2 * d_inner)
-    conv1d = d_conv * d_inner
-    x_proj = d_inner * (dt_rank + 2 * d_state)
-    dt_proj = dt_rank * d_inner + d_inner
-    out_proj = d_inner * d_model
-    mamba_params = in_proj + conv1d + x_proj + dt_proj + out_proj + d_state * d_inner + d_inner
-    layer_norm = d_model
-    per_layer = mamba_params + layer_norm
 
-    embedding_tied = vocab_size * d_model
+    in_proj = d_model * (2 * d_inner)
+    conv1d = d_inner * d_conv + d_inner       # weight + bias
+    x_proj = d_inner * (dt_rank + 2 * d_state)
+    dt_proj = dt_rank * d_inner + d_inner     # weight + bias
+    A_log = d_inner * d_state
+    D = d_inner
+    out_proj = d_inner * d_model
+    layer_norm = d_model
+
+    per_layer = in_proj + conv1d + x_proj + dt_proj + A_log + D + out_proj + layer_norm
+
+    tied_embedding = vocab_size * d_model
     final_norm = d_model
-    return embedding_tied + n_layers * per_layer + final_norm
+
+    return tied_embedding + n_layers * per_layer + final_norm
 
 
 def choose_near_target_mamba_config(vocab_size: int, target_params: int = 50_000_000) -> Dict[str, Any]:
