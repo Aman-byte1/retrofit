@@ -62,30 +62,76 @@ def create_speaker_pairs(dataset, speaker_encoder, device="cuda"):
     logger.info("Pre-computing speaker embeddings for training data...")
     
     embeddings = []
-    speaker_ids = []
     
     for i in tqdm(range(len(dataset)), desc="Extracting speaker embeddings"):
         sample = dataset[i]
         audio = sample["audio"]
-        spk_id = sample["speaker_id"]
         
         if isinstance(audio, np.ndarray):
             audio = torch.from_numpy(audio).float()
         
         emb = speaker_encoder(audio, sr=24000)  # Returns [1, 192]
         embeddings.append(emb.cpu())
-        speaker_ids.append(spk_id)
     
     embeddings = torch.cat(embeddings, dim=0)  # [N, 192]
     
-    # Convert speaker_ids to integer labels
-    unique_speakers = sorted(set(speaker_ids))
-    spk_to_idx = {spk: idx for idx, spk in enumerate(unique_speakers)}
-    speaker_labels = torch.tensor([spk_to_idx[s] for s in speaker_ids])
+    # Auto-discover speaker groups by clustering embeddings
+    # (since dataset metadata may not have reliable speaker IDs)
+    speaker_labels = _cluster_speakers(embeddings, threshold=0.75)
+    n_speakers = speaker_labels.max().item() + 1
     
-    logger.info(f"Extracted {len(embeddings)} embeddings from {len(unique_speakers)} speakers")
+    logger.info(f"Extracted {len(embeddings)} embeddings, discovered {n_speakers} speaker clusters")
     
-    return embeddings, speaker_labels, unique_speakers
+    return embeddings, speaker_labels, n_speakers
+
+
+def _cluster_speakers(
+    embeddings: torch.Tensor,
+    threshold: float = 0.75,
+) -> torch.Tensor:
+    """
+    Greedy clustering of speaker embeddings by cosine similarity.
+    
+    Two embeddings are assigned the same speaker label if their
+    cosine similarity exceeds the threshold.
+    
+    Args:
+        embeddings: [N, dim] speaker embeddings
+        threshold: cosine similarity threshold for same-speaker
+        
+    Returns:
+        [N] integer speaker labels
+    """
+    import torch.nn.functional as F
+    
+    N = embeddings.shape[0]
+    normed = F.normalize(embeddings, dim=-1)
+    
+    labels = torch.full((N,), -1, dtype=torch.long)
+    cluster_centroids = []
+    current_label = 0
+    
+    for i in range(N):
+        if len(cluster_centroids) > 0:
+            # Compare to existing cluster centroids
+            centroids = torch.stack(cluster_centroids)  # [K, dim]
+            sims = torch.matmul(normed[i:i+1], centroids.T).squeeze(0)  # [K]
+            best_sim, best_idx = sims.max(dim=0)
+            
+            if best_sim.item() >= threshold:
+                labels[i] = best_idx.item()
+                # Update centroid (running average)
+                cluster_centroids[best_idx.item()] = F.normalize(
+                    cluster_centroids[best_idx.item()] + normed[i], dim=-1
+                )
+                continue
+        
+        # New cluster
+        labels[i] = current_label
+        cluster_centroids.append(normed[i].clone())
+        current_label += 1
+    
+    return labels
 
 
 def train_adapter(

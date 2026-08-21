@@ -194,30 +194,35 @@ class ContrastiveLoss(nn.Module):
         Returns:
             Scalar loss
         """
+        batch_size = embeddings.shape[0]
+        if batch_size < 2:
+            return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+        
         # Normalize embeddings
         embeddings = nn.functional.normalize(embeddings, dim=-1)
         
         # Compute similarity matrix [batch, batch]
         sim_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
         
-        # Create positive mask: same speaker = positive pair
+        # Masks (detached, not part of computation graph)
+        # Diagonal mask: exclude self-comparisons
+        diag_mask = ~torch.eye(batch_size, dtype=torch.bool, device=embeddings.device)
+        diag_mask_float = diag_mask.float()
+        
+        # Positive mask: same speaker, excluding self
         speaker_ids = speaker_ids.view(-1)
         pos_mask = (speaker_ids.unsqueeze(0) == speaker_ids.unsqueeze(1)).float()
-        
-        # Remove self-similarities from diagonal
-        pos_mask.fill_diagonal_(0)
+        pos_mask = pos_mask * diag_mask_float  # Remove self-similarities
         
         # Check if there are any positive pairs
         if pos_mask.sum() == 0:
-            # No same-speaker pairs in batch — use uniformity loss instead
+            # No same-speaker pairs — use uniformity loss instead
             return self._uniformity_loss(embeddings)
         
-        # For each anchor, compute log-sum-exp over all non-self entries
-        # and subtract the log of positive pair similarities
-        exp_sim = torch.exp(sim_matrix)
-        exp_sim.fill_diagonal_(0)  # Exclude self
+        # Exp similarities, zeroing diagonal via multiplication (NOT in-place)
+        exp_sim = torch.exp(sim_matrix) * diag_mask_float
         
-        # Log denominator: log(sum of all exp similarities)
+        # Log denominator: log(sum of all non-self exp similarities)
         log_denom = torch.log(exp_sim.sum(dim=1) + 1e-8)
         
         # Log numerator: log(mean of positive pair similarities)
