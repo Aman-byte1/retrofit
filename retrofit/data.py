@@ -7,6 +7,11 @@ Handles:
 - Audio preprocessing and batching
 """
 
+import os
+
+# Force soundfile backend for audio decoding (avoids torchcodec/libnvrtc issues)
+os.environ["HF_AUDIO_DECODER"] = "soundfile"
+
 import torch
 import torchaudio
 import numpy as np
@@ -41,8 +46,12 @@ class IWSLTEvalDataset(Dataset):
         )
         
         # Filter by language if specified
+        # NOTE: We use index-based selection instead of ds.filter() to avoid
+        # triggering audio column decoding (which crashes with torchcodec)
         if language:
-            self.ds = self.ds.filter(lambda x: x["language"] == language)
+            lang_column = self.ds["language"]  # Fast: reads only this column
+            indices = [i for i, lang in enumerate(lang_column) if lang == language]
+            self.ds = self.ds.select(indices)
             logger.info(f"Filtered to language={language}: {len(self.ds)} samples")
         
         # Limit samples
@@ -143,7 +152,9 @@ class MultiSpeakerTrainDataset(Dataset):
         )
         
         if language:
-            ds = ds.filter(lambda x: x["language"] == language)
+            lang_column = ds["language"]
+            indices = [i for i, l in enumerate(lang_column) if l == language]
+            ds = ds.select(indices)
         
         # Split into train/val
         n_total = len(ds)
@@ -194,7 +205,9 @@ class MultiSpeakerTrainDataset(Dataset):
             ds = load_dataset(dataset_name, split="train")
             if "language" in ds.column_names or "locale" in ds.column_names:
                 lang_col = "language" if "language" in ds.column_names else "locale"
-                ds = ds.filter(lambda x: x[lang_col] == language)
+                lang_column = ds[lang_col]
+                indices = [i for i, l in enumerate(lang_column) if l == language]
+                ds = ds.select(indices)
         
         n_total = len(ds)
         n_train = int(n_total * train_split)
