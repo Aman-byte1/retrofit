@@ -153,16 +153,15 @@ def _chunk_delta_rule(
     state = torch.zeros(B, H, K_dim, V_dim, device=q.device, dtype=q.dtype)
     outputs = []
 
+    mask = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool))
+
     for c in range(num_chunks):
         qc = q_chunks[:, :, c]        # [B, H, chunk_size, K_dim]
         kc = k_chunks[:, :, c]        # [B, H, chunk_size, K_dim]
         vc = v_chunks[:, :, c]        # [B, H, chunk_size, V_dim]
         betac = beta_chunks[:, :, c]  # [B, H, chunk_size]
 
-        intra_attn = torch.matmul(qc, kc.transpose(-1, -2))  # [B, H, chunk_size, chunk_size]
-        mask = torch.tril(torch.ones(chunk_size, chunk_size, device=q.device, dtype=torch.bool))
-        intra_attn = intra_attn.masked_fill(~mask, 0.0)
-
+        intra_attn = torch.matmul(qc, kc.transpose(-1, -2)).masked_fill(~mask, 0.0)
         betac_v = betac.unsqueeze(-1) * vc
         intra_out = torch.matmul(intra_attn, betac_v)
 
@@ -170,11 +169,15 @@ def _chunk_delta_rule(
         chunk_out = intra_out + inter_out
         outputs.append(chunk_out)
 
-        # Update state: state = state + k^T * (beta * (v - k * state))
-        k_state = torch.matmul(kc, state)  # [B, H, chunk_size, V_dim]
-        err = betac.unsqueeze(-1) * (vc - k_state)
-        state_delta = torch.matmul(kc.transpose(-1, -2), err)
-        state = state + state_delta
+        # Exact recurrent state step inside chunk
+        for i in range(chunk_size):
+            k_i = kc[:, :, i:i+1]          # [B, H, 1, K]
+            v_i = vc[:, :, i:i+1]          # [B, H, 1, V]
+            b_i = betac[:, :, i:i+1, None] # [B, H, 1, 1]
+
+            v_pred = torch.matmul(k_i, state) # [B, H, 1, V]
+            err = v_i - v_pred
+            state = state + b_i * torch.matmul(k_i.transpose(-1, -2), err)
 
     out = torch.cat(outputs, dim=2)
     if pad_len > 0:
@@ -259,6 +262,10 @@ class GatedDeltaNet(nn.Module):
         q = F.silu(q).view(B, T, self.num_key_heads, self.key_head_dim).transpose(1, 2)
         k = F.silu(k).view(B, T, self.num_key_heads, self.key_head_dim).transpose(1, 2)
         v = F.silu(v).view(B, T, self.num_value_heads, self.value_head_dim).transpose(1, 2)
+
+        # L2-normalize keys and queries to guarantee contractive delta updates and numerical stability
+        k = F.normalize(k, p=2, dim=-1)
+        q = F.normalize(q, p=2, dim=-1)
 
         beta = torch.sigmoid(beta_raw + self.dt_bias).transpose(1, 2)  # [B, H, T]
 
