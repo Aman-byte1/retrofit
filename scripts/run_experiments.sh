@@ -1,16 +1,17 @@
 #!/bin/bash
 # ============================================================
-# Full Architecture Comparison Benchmark
+# Full Architecture Comparison Benchmark (50M Parameters)
 #
 # Trains 4 architectures on Amharic Wikipedia, benchmarks all,
-# and generates analysis report.
+# and generates comprehensive comparative report and plots.
 # ============================================================
 set -euo pipefail
 
-EPOCHS=5
-BATCH_SIZE=32
-SEQ_LEN=512
-LR=3e-4
+EPOCHS=${EPOCHS:-1}
+BATCH_SIZE=${BATCH_SIZE:-64}
+SEQ_LEN=${SEQ_LEN:-512}
+LR=${LR:-3e-4}
+WARMUP_STEPS=${WARMUP_STEPS:-50}
 VOCAB_SIZE=3919
 RESULTS_DIR="results"
 
@@ -19,6 +20,7 @@ echo "  Amharic LM Architecture Comparison"
 echo "  Architectures: Transformer, HRM, Mamba, Hybrid"
 echo "  Tokenizer: RL-trained Amharic (${VOCAB_SIZE} tokens)"
 echo "  Target: ~50M parameters each"
+echo "  Epochs: ${EPOCHS} | Batch Size: ${BATCH_SIZE} | Seq Len: ${SEQ_LEN}"
 echo "  $(date)"
 echo "============================================================"
 
@@ -46,6 +48,7 @@ python train.py \
     --epochs $EPOCHS \
     --batch-size $BATCH_SIZE \
     --grad-accum 1 \
+    --warmup-steps $WARMUP_STEPS \
     --seq-len $SEQ_LEN \
     --lr $LR
 
@@ -62,8 +65,9 @@ python train.py \
     --data-dir data/tokenized \
     --output-dir $RESULTS_DIR \
     --epochs $EPOCHS \
-    --batch-size 16 \
+    --batch-size 32 \
     --grad-accum 2 \
+    --warmup-steps $WARMUP_STEPS \
     --seq-len $SEQ_LEN \
     --lr $LR
 
@@ -82,6 +86,7 @@ python train.py \
     --epochs $EPOCHS \
     --batch-size $BATCH_SIZE \
     --grad-accum 1 \
+    --warmup-steps $WARMUP_STEPS \
     --seq-len $SEQ_LEN \
     --lr $LR \
     --mamba-backend auto
@@ -101,6 +106,7 @@ python train.py \
     --epochs $EPOCHS \
     --batch-size $BATCH_SIZE \
     --grad-accum 1 \
+    --warmup-steps $WARMUP_STEPS \
     --seq-len $SEQ_LEN \
     --lr $LR \
     --mamba-backend auto
