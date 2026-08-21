@@ -156,7 +156,7 @@ def upload_to_huggingface(
     # Copy code & architecture modules
     shutil.copytree(models_dir, staging_dir / "models")
     shutil.copytree(tokenizer_dir, staging_dir / "tokenizer")
-    for script in ["train.py", "benchmark.py", "analyze.py", "generate_samples.py", "paper.tex"]:
+    for script in ["train.py", "benchmark.py", "analyze.py", "generate_samples.py", "paper.tex", "paper.pdf"]:
         if os.path.exists(script):
             shutil.copy2(script, staging_dir / script)
 

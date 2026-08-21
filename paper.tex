@@ -4,21 +4,27 @@
 % Typography and Geometry
 % -----------------------------------------------------------------------------
 \usepackage[margin=1in]{geometry}
-\usepackage{amsmath,amssymb,amsfonts,amsthm,mathtools}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
 \usepackage{booktabs}
 \usepackage{tabularx}
 \usepackage{graphicx}
 \usepackage{hyperref}
-\usepackage{microtype}
 \usepackage{xcolor}
 \usepackage{caption}
-\usepackage{subcaption}
-\usepackage{algorithm}
-\usepackage{algpseudocode}
-\usepackage{listings}
-\usepackage{enumitem}
 \usepackage{tikz}
 \usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, calc, backgrounds}
+
+% Font setup for XeLaTeX supporting Ethiopic (Ge'ez script)
+\usepackage{fontspec}
+\defaultfontfeatures{Ligatures=TeX}
+\setmainfont{Times New Roman}[
+    BoldFont = Times New Roman,
+    ItalicFont = Times New Roman,
+    BoldItalicFont = Times New Roman
+]
+\newfontfamily\ethiopicfont{Nyala}[Scale=1.1]
+
+\newtheorem{theorem}{Theorem}
 
 % Hyperlink configuration
 \hypersetup{
@@ -52,7 +58,7 @@
 \maketitle
 
 \begin{abstract}
-Autoregressive language models for non-Latin and morphologically rich low-resource languages face significant computational constraints under standard quadratic Transformer architectures. While sub-quadratic alternatives such as chunk-parallel linear attention with data-dependent delta update rules (Qwen3.5 Gated DeltaNet), dual-timescale hierarchical recurrent reasoning (HRM-Text), and continuous-time selective state space models (Mamba) have emerged as potential successors, direct empirical comparisons under strict parameter and data equivalence have been largely unexplored for African languages. In this study, we conduct the first controlled empirical investigation comparing four architectural families strictly calibrated to approximately $50$ million parameters ($\sim 50\text{M}$) pretrained from scratch on the Amharic Wikipedia corpus using an RL-optimized subword vocabulary ($V = 3,919$). Pretrained under unified mixed-precision conditions on an NVIDIA A100 80GB GPU, we track convergence rates, validation perplexity, training throughput, peak memory allocation, and qualitative generation quality. Our findings reveal that the **Qwen3.5 hybrid architecture (3:1 Gated DeltaNet to Attention with Multi-Token Prediction)** attains the lowest validation cross-entropy loss ($2.2243$) and perplexity ($\text{PPL} = 9.25$). Simultaneously, **HRM-Text** achieves competitive linguistic perplexity ($\text{PPL} = 10.83$) while delivering a remarkable **$9.4\times$ throughput speedup** ($43,078\text{ tokens/sec}$ vs. $4,565\text{ tokens/sec}$) and **$22.4\times$ memory reduction** ($3.43\text{ GB}$ vs. $76.68\text{ GB}$ peak VRAM). We release all pretrained weights, tokenizers, benchmark code, and dataset pipelines openly on the Hugging Face Hub.
+Autoregressive language models for non-Latin and morphologically rich low-resource languages face significant computational constraints under standard quadratic Transformer architectures. While sub-quadratic alternatives such as chunk-parallel linear attention with data-dependent delta update rules (Qwen3.5 Gated DeltaNet), dual-timescale hierarchical recurrent reasoning (HRM-Text), and continuous-time selective state space models (Mamba) have emerged as potential successors, direct empirical comparisons under strict parameter and data equivalence have been largely unexplored for African languages. In this study, we conduct the first controlled empirical investigation comparing four architectural families strictly calibrated to approximately $50$ million parameters ($\sim 50\text{M}$) pretrained from scratch on the Amharic Wikipedia corpus using an RL-optimized subword vocabulary ($V = 3,919$). Pretrained under unified mixed-precision conditions on an NVIDIA A100 80GB GPU, we track convergence rates, validation perplexity, training throughput, peak memory allocation, and qualitative generation quality. Our findings reveal that the \textbf{Qwen3.5 hybrid architecture (3:1 Gated DeltaNet to Attention with Multi-Token Prediction)} attains the lowest validation cross-entropy loss ($2.2243$) and perplexity ($\text{PPL} = 9.25$). Simultaneously, \textbf{HRM-Text} achieves competitive linguistic perplexity ($\text{PPL} = 10.83$) while delivering a remarkable \textbf{$9.4\times$ throughput speedup} ($43,078\text{ tokens/sec}$ vs. $4,565\text{ tokens/sec}$) and \textbf{$22.4\times$ memory reduction} ($3.43\text{ GB}$ vs. $76.68\text{ GB}$ peak VRAM). We release all pretrained weights, tokenizers, benchmark code, and dataset pipelines openly on the Hugging Face Hub.
 \end{abstract}
 
 % -----------------------------------------------------------------------------
@@ -62,17 +68,17 @@ Autoregressive language models for non-Latin and morphologically rich low-resour
 
 Large language models (LLMs) have achieved remarkable linguistic and reasoning capabilities across major world languages. However, the majority of research and benchmarking remains concentrated on high-resource Indo-European languages utilizing the Latin alphabet \cite{joshi2020state}. Morphologically rich languages that utilize indigenous non-Latin scripts---such as the Semitic languages of the Horn of Africa---remain severely under-represented in core architectural literature \cite{amharic_nlp_2024}.
 
-Amharic, spoken by over 57 million people, is the working language of Ethiopia and the second most widely spoken Semitic language globally after Arabic. Unlike concatenative European languages, Amharic possesses an intricate **non-concatenative root-and-pattern morphology**, where words are formed by interleaving vocalic patterns into multi-consonantal roots (predominantly triconsonantal), combined with extensive agglutinative affixation (prefixes, infixes, suffixes) expressing case, tense, mood, gender, and definiteness \cite{bender1976language, yimam2021amharic}. Furthermore, Amharic is written in the Ethiopic syllabary (Ge'ez script), where each character represents a consonant-vowel syllable pair (e.g., \textit{ha}, \textit{hu}, \textit{hi}, \textit{ha}, \textit{he}, \textit{hə}, \textit{ho}).
+Amharic, spoken by over 57 million people, is the working language of Ethiopia and the second most widely spoken Semitic language globally after Arabic. Unlike concatenative European languages, Amharic possesses an intricate \textbf{non-concatenative root-and-pattern morphology}, where words are formed by interleaving vocalic patterns into multi-consonantal roots (predominantly triconsonantal), combined with extensive agglutinative affixation (prefixes, infixes, suffixes) expressing case, tense, mood, gender, and definiteness \cite{bender1976language, yimam2021amharic}. Furthermore, Amharic is written in the Ethiopic syllabary (Ge'ez script), where each character represents a consonant-vowel syllable pair (e.g., \textit{ha}, \textit{hu}, \textit{hi}, \textit{ha}, \textit{he}, \textit{hə}, \textit{ho}).
 
 Standard dense Transformer architectures \cite{vaswani2017attention} suffer from severe practical inefficiencies when applied to such languages:
-\begin{enumerate}[leftmargin=*]
+\begin{enumerate}
     \item \textbf{Quadratic Attention Bottleneck}: The softmax attention mechanism requires $O(L^2)$ computation and $O(L^2)$ memory for sequence length $L$, severely limiting context expansion on resource-constrained infrastructure.
     \item \textbf{High Memory Redundancy}: Autoregressive generation necessitates storing continuous key-value (KV) caches that grow linearly with sequence length and batch size.
     \item \textbf{Uniform Depth Computation}: Standard Transformers apply identical compute depth across all tokens, failing to decouple high-level multi-step conceptual reasoning from low-level morphological syntax.
 \end{enumerate}
 
 To address these limitations, several alternative architectural paradigms have recently emerged:
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item \textbf{Gated Linear Delta Networks (Qwen3.5)}: Formulates linear attention through chunk-parallel associative memory with data-dependent update gates ($\beta$) and contractive state updates \cite{qwen2025, yang2024gated}.
     \item \textbf{Hierarchical Recurrent Models (HRM-Text)}: Decomposes language processing into dual-timescale coupled recurrence ($H_2L_3$), parameterless MagicNorm normalization, and warmup truncated backpropagation through time (TBPTT) \cite{wang2026hrm}.
     \item \textbf{Selective State Space Models (Mamba)}: Employs continuous-time state spaces parameterized by input-dependent dynamic matrices ($\mathbf{B}, \mathbf{C}, \boldsymbol{\Delta}$) and hardware-aware associative scans \cite{gu2023mamba}.
@@ -95,8 +101,7 @@ To ensure absolute fairness, all models are calibrated to approximately $50$ mil
     every node/.style={font=\footnotesize},
     block/.style={draw=blue!80!black, fill=blue!8, rounded corners=4pt, minimum height=2.2em, minimum width=5.5em, align=center, thick},
     hrmblock/.style={draw=cyan!80!black, fill=cyan!8, rounded corners=4pt, minimum height=2.2em, minimum width=5.5em, align=center, thick},
-    mambablock/.style={draw=green!60!black, fill=green!8, rounded corners=4pt, minimum height=2.2em, minimum width=5.5em, align=center, thick},
-    arrow/.style={-Latex[length=2.5mm], thick, draw=gray!70!black}
+    arrow/.style={->, thick, >=stealth, draw=gray!70!black}
 ]
 
     % Qwen3.5 Subgraph
@@ -215,7 +220,7 @@ Tokenization is performed using a specialized reinforcement-learning-derived sub
 
 \subsection{Training Protocol}
 All architectures are pretrained under identical optimization conditions:
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item \textbf{Compute Hardware}: $1\times$ NVIDIA A100 80GB PCIe GPU.
     \item \textbf{Precision}: Native \texttt{bfloat16} mixed precision.
     \item \textbf{Context Window}: Sequence length $L = 512$ tokens.
@@ -238,7 +243,7 @@ Table \ref{tab:main_results} reports the primary experimental metrics across all
 \small
 \caption{Comprehensive quantitative comparison across 50M-class architectures on the Amharic Wikipedia benchmark.}
 \label{tab:main_results}
-\begin{tabularx}{\textwidth}{lcccccccc}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccc}
 \toprule
 \textbf{Architecture} & \textbf{Layers} & \textbf{$d_{\text{model}}$} & \textbf{Parameters} & \textbf{Target Diff.} & \textbf{Speed (tok/s)} & \textbf{Peak VRAM} & \textbf{Train Time} & \textbf{Val PPL ($\downarrow$)} \\
 \midrule
@@ -248,7 +253,7 @@ Table \ref{tab:main_results} reports the primary experimental metrics across all
 \textbf{Hybrid Mamba-Attn} & 18 & 448 & 52,038,560 & +4.08\% & --- & --- & --- & --- \\
 \bottomrule
 \multicolumn{9}{l}{\footnotesize *Pure PyTorch uncompiled fallback scan without CUDA C++ extension. $^\dagger$Zero-shot untrained baseline perplexity.}
-\end{tabularx}
+\end{tabular*}
 \end{table*}
 
 \subsection{Key Findings}
@@ -258,10 +263,10 @@ The Qwen3.5 architecture achieves the lowest final validation cross-entropy loss
 
 \paragraph{2. Extreme Efficiency of HRM-Text}
 HRM-Text establishes an extraordinary computational profile:
-\begin{itemize}[leftmargin=*]
-    \item \textbf{$9.4\times$ Higher Throughput}: Achieved **$43,078\text{ tokens/sec}$** compared to $4,565\text{ tokens/sec}$ for the Transformer.
-    \item \textbf{$22.4\times$ Lower VRAM}: Peak GPU memory allocation was only **$3.43\text{ GB}$**, compared to $76.68\text{ GB}$ for Transformer.
-    \item \textbf{Competitive Convergence}: Completed a full pretraining pass over $6.3\text{M}$ tokens in **$2.5\text{ minutes}$**, reaching a validation perplexity of **$10.83$**.
+\begin{itemize}
+    \item \textbf{$9.4\times$ Higher Throughput}: Achieved \textbf{$43,078\text{ tokens/sec}$} compared to $4,565\text{ tokens/sec}$ for the Transformer.
+    \item \textbf{$22.4\times$ Lower VRAM}: Peak GPU memory allocation was only \textbf{$3.43\text{ GB}$}, compared to $76.68\text{ GB}$ for Transformer.
+    \item \textbf{Competitive Convergence}: Completed a full pretraining pass over $6.3\text{M}$ tokens in \textbf{$2.5\text{ minutes}$}, reaching a validation perplexity of \textbf{$10.83$}.
 \end{itemize}
 
 \subsection{Qualitative Amharic Text Generation}
@@ -277,22 +282,22 @@ Table \ref{tab:qualitative_samples} presents sample autoregressive text completi
 \toprule
 \textbf{Prompt} & \textbf{Model Generated Continuation} \\
 \midrule
-\textbf{Prompt 1:} \newline \textit{ኢትዮጵያ በምሥራቅ አፍሪካ የምትገኝ} \newline \footnotesize(Ethiopia is located in East Africa...) & 
-\textbf{Qwen3.5}: ...ውስጥ ሲሆን በእስፓንያ ይከበሮችን በኋላ የጥንታዊ ከእንስተ መንግት ሲሆን በስተዳባ ሲ... \newline
-\textbf{HRM-Text}: ...ራ ናት። በታሪክና በባህል የበለጸገች ስትሆን የተለያዩ ብሔር ብሔረሰቦች የሚኖሩባት... \\
+\textbf{Prompt 1:} \newline {\ethiopicfont ኢትዮጵያ በምሥራቅ አፍሪካ የምትገኝ} \newline \footnotesize(Ethiopia is located in East Africa...) & 
+\textbf{Qwen3.5}: {\ethiopicfont ...ውስጥ ሲሆን በእስፓንያ ይከበሮችን በኋላ የጥንታዊ ከእንስተ መንግት ሲሆን በስተዳባ ሲ...} \newline
+\textbf{HRM-Text}: {\ethiopicfont ...ራ ናት። በታሪክና በባህል የበለጸገች ስትሆን የተለያዩ ብሔር ብሔረሰቦች የሚኖሩባት...} \\
 \midrule
-\textbf{Prompt 2:} \newline \textit{አዲስ አበባ የኢትዮጵያ ዋና ከተማ} \newline \footnotesize(Addis Ababa the capital of Ethiopia...) & 
-\textbf{Qwen3.5}: ...ነው። በዚህ አቆጣጠር በ 1979 በኢትዮጵያ እስከ 1991 .ም. ድረስ በኋላ በዝብ ከዚህ መት በኋላ... \newline
-\textbf{HRM-Text}: ...ነው። በደቡብ በዘመነ ወይም በተሸጠቁ እንደ ዋት የዝብ ከነዚህ ዝብ በማናቸው የኤሎቹ... \\
+\textbf{Prompt 2:} \newline {\ethiopicfont አዲስ አበባ የኢትዮጵያ ዋና ከተማ} \newline \footnotesize(Addis Ababa the capital of Ethiopia...) & 
+\textbf{Qwen3.5}: {\ethiopicfont ...ነው። በዚህ አቆጣጠር በ 1979 በኢትዮጵያ እስከ 1991 .ም. ድረስ በኋላ በዝብ ከዚህ መት በኋላ...} \newline
+\textbf{HRM-Text}: {\ethiopicfont ...ነው። በደቡብ በዘመነ ወይም በተሸጠቁ እንደ ዋት የዝብ ከነዚህ ዝብ በማናቸው የኤሎቹ...} \\
 \midrule
-\textbf{Prompt 3:} \newline \textit{የሳይንስና የቴክኖሎጂ እድገት ለሀገር} \newline \footnotesize(Advancement of science and tech...) & 
-\textbf{Qwen3.5}: ...ሲያስተዳደግ የኢኮኖሚ እና የማህበራዊ እድገት ከፍተኛ ሚና ይጫወታል። \newline
-\textbf{HRM-Text}: ...እንዲሁም ከአረሰል አር እንደ ያላቸው ም እስከ በማስተዋ አስተኛ የአማርኛ ምሳሌ ነው። \\
+\textbf{Prompt 3:} \newline {\ethiopicfont የሳይንስና የቴክኖሎጂ እድገት ለሀገር} \newline \footnotesize(Advancement of science and tech...) & 
+\textbf{Qwen3.5}: {\ethiopicfont ...ሲያስተዳደግ የኢኮኖሚ እና የማህበራዊ እድገት ከፍተኛ ሚና ይጫወታል።} \newline
+\textbf{HRM-Text}: {\ethiopicfont ...እንዲሁም ከአረሰል አር እንደ ያላቸው ም እስከ በማስተዋ አስተኛ የአማርኛ ምሳሌ ነው።} \\
 \bottomrule
 \end{tabularx}
 \end{table*}
 
-Both models demonstrate strong syntactic agreement, correctly matching Amharic copular verbs (\textit{ነው}, \textit{ናት}, \textit{ሲሆን}) with masculine and feminine subject head nouns.
+Both models demonstrate strong syntactic agreement, correctly matching Amharic copular verbs ({\ethiopicfont ነው}, {\ethiopicfont ናት}, {\ethiopicfont ሲሆን}) with masculine and feminine subject head nouns.
 
 % -----------------------------------------------------------------------------
 \section{Conclusion and Future Work}
@@ -300,7 +305,7 @@ Both models demonstrate strong syntactic agreement, correctly matching Amharic c
 % -----------------------------------------------------------------------------
 
 In this study, we conducted a rigorous, parameter-matched empirical comparison of 50M-class language models on the low-resource Semitic language Amharic. Our experiments demonstrate that:
-\begin{enumerate}[leftmargin=*]
+\begin{enumerate}
     \item Hybrid architectures combining $L_2$-normalized linear associative memory (Gated DeltaNet) with periodic full attention achieve state-of-the-art representation quality ($\text{PPL} = 9.25$).
     \item Dual-timescale hierarchical recurrent models (HRM-Text) provide unprecedented training throughput ($43,078\text{ tok/s}$) and minimal memory footprint ($3.43\text{ GB}$) with minimal degradation in perplexity ($\text{PPL} = 10.83$).
 \end{enumerate}
