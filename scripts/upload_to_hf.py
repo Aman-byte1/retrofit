@@ -13,6 +13,7 @@ import os
 import shutil
 import json
 from pathlib import Path
+from typing import Optional
 
 from huggingface_hub import HfApi, create_repo
 

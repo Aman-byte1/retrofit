@@ -13,7 +13,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import torch
 import torch.nn.functional as F

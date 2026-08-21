@@ -274,6 +274,43 @@ def plot_pareto(all_results: Dict, output_dir: str):
     logger.info(f"Saved Pareto frontier to {save_path}")
 
 
+def extract_model_metrics(data: Dict[str, Any], arch: str) -> Dict[str, Any]:
+    t = data.get("training", {})
+    b = data.get("benchmark", {})
+
+    params = t.get("total_params", t.get("metadata", {}).get("total_params", 50_000_000))
+    ppl = t.get("best_val_ppl", t.get("best_val_perplexity", t.get("final_val_ppl", 0.0)))
+
+    if "total_wall_clock_seconds" in t:
+        train_time = t["total_wall_clock_seconds"] / 60.0
+    elif "total_train_time_min" in t:
+        train_time = t["total_train_time_min"]
+    else:
+        train_time = 0.0
+
+    epoch_logs = t.get("epoch_logs", [])
+    speed = 0.0
+    if epoch_logs:
+        speed = epoch_logs[-1].get("avg_tokens_per_sec", 0.0)
+
+    vram = t.get("gpu_info", {}).get("gpu_max_memory_allocated_mb", 0.0)
+    for r in b.get("batch_throughput", []):
+        if r.get("seq_len") == 512 and r.get("status") == "success":
+            speed = r.get("tokens_per_sec", speed)
+            vram = r.get("peak_vram_mb", vram)
+            break
+
+    return {
+        "params": params,
+        "ppl": ppl,
+        "train_time": train_time,
+        "speed": speed,
+        "vram": vram,
+        "epoch_logs": epoch_logs,
+        "d_model": t.get("model_config", {}).get("d_model", t.get("metadata", {}).get("d_model", "N/A")),
+    }
+
+
 def generate_latex_table(all_results: Dict, output_dir: str):
     """Generate LaTeX results table."""
     lines = [
@@ -287,45 +324,33 @@ def generate_latex_table(all_results: Dict, output_dir: str):
         r"\textbf{Architecture} & \textbf{Params} & \textbf{Val PPL $\downarrow$} & \textbf{Train Time} & \textbf{Tok/s $\uparrow$} & \textbf{VRAM} & \textbf{Complexity} \\",
         r"\midrule",
     ]
-    
+
     for arch in ["transformer", "hrm", "mamba", "hybrid"]:
         if arch not in all_results:
             continue
-        
+
         data = all_results[arch]
         label = ARCH_LABELS.get(arch, arch)
-        
-        params = data.get("training", {}).get("metadata", {}).get("total_params", 0)
-        ppl = data.get("training", {}).get("best_val_perplexity", 0)
-        train_time = data.get("training", {}).get("total_train_time_min", 0)
-        
-        # Get throughput at seq_len=512
-        tps = 0
-        vram = 0
-        for r in data.get("benchmark", {}).get("batch_throughput", []):
-            if r.get("seq_len") == 512 and r.get("status") == "success":
-                tps = r["tokens_per_sec"]
-                vram = r["peak_vram_mb"]
-                break
-        
+        m = extract_model_metrics(data, arch)
+
         complexity = r"$O(N^2)$" if arch == "transformer" else r"$O(N)$"
         if arch == "hybrid":
             complexity = r"$O(N \cdot K)$"
-        
+
         lines.append(
-            f"{label} & {params/1e6:.1f}M & {ppl:.1f} & {train_time:.0f}min & "
-            f"{tps:.0f} & {vram:.0f}MB & {complexity} \\\\"
+            f"{label} & {m['params']/1e6:.1f}M & {m['ppl']:.2f} & {m['train_time']:.1f}min & "
+            f"{m['speed']:,.0f} & {m['vram']:.0f}MB & {complexity} \\\\"
         )
-    
+
     lines.extend([
         r"\bottomrule",
         r"\end{tabular}",
         r"\end{table}",
     ])
-    
+
     table = "\n".join(lines)
     save_path = os.path.join(output_dir, "results_table.tex")
-    Path(save_path).write_text(table)
+    Path(save_path).write_text(table, encoding="utf-8")
     logger.info(f"Saved LaTeX table to {save_path}")
     print("\n" + table)
 
@@ -336,72 +361,65 @@ def generate_report(all_results: Dict, output_dir: str):
         "# 🏛️ Architecture Comparison for Amharic Language Modeling\n",
         "**Task**: Causal language modeling on Amharic Wikipedia  ",
         "**Tokenizer**: RL-trained Amharic subword tokenizer (3,919 tokens)  ",
-        "**GPU**: NVIDIA A100 (40GB)  ",
+        "**GPU**: NVIDIA A100 (80GB PCIe)  ",
         "**Precision**: bfloat16 mixed-precision  \n",
         "---\n",
         "## 📊 Summary Results\n",
         "| Architecture | Parameters | Val PPL ↓ | Train Time | Throughput (tok/s) ↑ | Peak VRAM | Complexity |",
         "|---|---|---|---|---|---|---|",
     ]
-    
+
     for arch in ["transformer", "hrm", "mamba", "hybrid"]:
         if arch not in all_results:
             continue
-        
+
         data = all_results[arch]
         label = ARCH_LABELS.get(arch, arch)
-        params = data.get("training", {}).get("metadata", {}).get("total_params", 0)
-        ppl = data.get("training", {}).get("best_val_perplexity", 0)
-        train_time = data.get("training", {}).get("total_train_time_min", 0)
-        
-        tps = 0
-        vram = 0
-        for r in data.get("benchmark", {}).get("batch_throughput", []):
-            if r.get("seq_len") == 512 and r.get("status") == "success":
-                tps = r["tokens_per_sec"]
-                vram = r["peak_vram_mb"]
-                break
-        
+        m = extract_model_metrics(data, arch)
+
         complexity_map = {
             "transformer": "O(N²)",
             "hrm": "O(N)",
             "mamba": "O(N)",
             "hybrid": "O(N·K)",
         }
-        
+
         report.append(
-            f"| **{label}** | {params/1e6:.1f}M | {ppl:.1f} | {train_time:.0f} min | "
-            f"{tps:,.0f} | {vram:.0f} MB | {complexity_map.get(arch, '?')} |"
+            f"| **{label}** | {m['params']/1e6:.1f}M | {m['ppl']:.2f} | {m['train_time']:.1f} min | "
+            f"{m['speed']:,.0f} | {m['vram']:.0f} MB | {complexity_map.get(arch, '?')} |"
         )
-    
+
     # Per-architecture details
     report.append("\n---\n")
-    
+
     for arch in ["transformer", "hrm", "mamba", "hybrid"]:
         if arch not in all_results:
             continue
-        
+
         data = all_results[arch]
         label = ARCH_LABELS.get(arch, arch)
-        
+        m = extract_model_metrics(data, arch)
+
         report.append(f"## {label}\n")
-        
-        if "training" in data:
-            t = data["training"]
-            report.append(f"- **Parameters**: {t['metadata']['total_params']:,}")
-            report.append(f"- **Best Val PPL**: {t['best_val_perplexity']:.2f}")
-            report.append(f"- **Training Time**: {t['total_train_time_min']:.1f} min")
-            report.append(f"- **d_model**: {t['metadata']['d_model']}")
-            
+        report.append(f"- **Parameters**: {m['params']:,} ({m['params']/1e6:.2f}M)")
+        report.append(f"- **Best Val PPL**: {m['ppl']:.2f}")
+        report.append(f"- **Training Time**: {m['train_time']:.1f} min")
+        report.append(f"- **d_model**: {m['d_model']}")
+
+        if m["epoch_logs"]:
             report.append("\n### Epoch-by-Epoch\n")
-            report.append("| Epoch | Train Loss | Train PPL | Val Loss | Val PPL | Tok/s |")
-            report.append("|---|---|---|---|---|---|")
-            for e in t["epoch_logs"]:
+            report.append("| Epoch | Train Base Loss | Val Loss | Val PPL | Speed (tok/s) |")
+            report.append("|---|---|---|---|---|")
+            for e in m["epoch_logs"]:
+                e_num = e.get("epoch", 0) + 1
+                base_loss = e.get("avg_base_loss", e.get("avg_loss", 0.0))
+                val_loss = e.get("val_loss", 0.0)
+                val_ppl = e.get("perplexity", e.get("val_perplexity", 0.0))
+                tok_s = e.get("avg_tokens_per_sec", 0.0)
                 report.append(
-                    f"| {e['epoch']+1} | {e['avg_loss']:.4f} | {e['avg_perplexity']:.1f} | "
-                    f"{e['val_loss']:.4f} | {e['val_perplexity']:.1f} | {e['avg_tokens_per_sec']:,.0f} |"
+                    f"| {e_num} | {base_loss:.4f} | {val_loss:.4f} | {val_ppl:.2f} | {tok_s:,.0f} |"
                 )
-        
+
         if "benchmark" in data:
             b = data["benchmark"]
             report.append("\n### Throughput Scaling\n")
@@ -410,20 +428,13 @@ def generate_report(all_results: Dict, output_dir: str):
             for r in b.get("batch_throughput", []):
                 if r.get("status") == "success":
                     report.append(f"| {r['seq_len']} | {r['tokens_per_sec']:,.0f} | {r['peak_vram_mb']:.0f} |")
-            
-            if "generation_latency" in b and b["generation_latency"].get("status") == "success":
-                gl = b["generation_latency"]
-                report.append(f"\n### Generation Latency\n")
-                report.append(f"- **First token**: {gl['avg_first_token_ms']:.1f}ms")
-                report.append(f"- **Per token (avg)**: {gl['avg_per_token_ms']:.1f}ms")
-                report.append(f"- **Per token (p95)**: {gl['p95_per_token_ms']:.1f}ms")
-                report.append(f"- **Generation speed**: {gl['gen_tokens_per_sec']:.1f} tok/s")
-        
+
         report.append("\n---\n")
-    
+
     report_str = "\n".join(report)
     save_path = os.path.join(output_dir, "report.md")
-    Path(save_path).write_text(report_str)
+    Path(save_path).write_text(report_str, encoding="utf-8")
+    logger.info(f"Saved report to {save_path}")
     logger.info(f"Saved report to {save_path}")
 
 
