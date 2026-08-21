@@ -5,22 +5,55 @@ Handles:
 - Loading the IWSLT evaluation dataset from HuggingFace
 - Loading multi-speaker training data
 - Audio preprocessing and batching
+
+NOTE: We disable the HF datasets audio decoder entirely and decode
+audio manually with soundfile, to avoid the torchcodec dependency.
 """
 
+import io
 import os
-
-# Force soundfile backend for audio decoding (avoids torchcodec/libnvrtc issues)
-os.environ["HF_AUDIO_DECODER"] = "soundfile"
-
 import torch
 import torchaudio
 import numpy as np
+import soundfile as sf
 import logging
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_audio_bytes(audio_field: Dict) -> Tuple[np.ndarray, int]:
+    """
+    Manually decode audio from HF datasets' raw format.
+    
+    When audio columns are loaded with decode=False, each entry is:
+      {"bytes": b"...", "path": "filename.wav"}
+    
+    We decode the bytes with soundfile.
+    """
+    raw_bytes = audio_field.get("bytes")
+    if raw_bytes is None:
+        raise ValueError("Audio field has no 'bytes' key")
+    
+    audio_array, sr = sf.read(io.BytesIO(raw_bytes))
+    
+    # Ensure mono
+    if audio_array.ndim > 1:
+        audio_array = audio_array.mean(axis=1)
+    
+    return audio_array.astype(np.float32), int(sr)
+
+
+def _resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample audio to target sample rate."""
+    if orig_sr == target_sr:
+        return audio
+    waveform = torch.from_numpy(audio).unsqueeze(0)
+    resampler = torchaudio.transforms.Resample(orig_sr, target_sr)
+    resampled = resampler(waveform).squeeze(0).numpy()
+    return resampled
 
 
 class IWSLTEvalDataset(Dataset):
@@ -37,7 +70,7 @@ class IWSLTEvalDataset(Dataset):
         target_sr: int = 24000,
         max_samples: Optional[int] = None,
     ):
-        from datasets import load_dataset
+        from datasets import load_dataset, Audio
         
         logger.info("Loading IWSLT evaluation dataset...")
         self.ds = load_dataset(
@@ -45,11 +78,16 @@ class IWSLTEvalDataset(Dataset):
             split="train",
         )
         
-        # Filter by language if specified
-        # NOTE: We use index-based selection instead of ds.filter() to avoid
-        # triggering audio column decoding (which crashes with torchcodec)
+        # Disable automatic audio decoding (avoids torchcodec dependency)
+        audio_columns = [c for c in self.ds.column_names
+                        if isinstance(self.ds.features[c], Audio)]
+        for col in audio_columns:
+            self.ds = self.ds.cast_column(col, Audio(decode=False))
+            logger.info(f"  Disabled auto-decode for column: {col}")
+        
+        # Filter by language using index-based selection (no row decoding)
         if language:
-            lang_column = self.ds["language"]  # Fast: reads only this column
+            lang_column = self.ds["language"]
             indices = [i for i, lang in enumerate(lang_column) if lang == language]
             self.ds = self.ds.select(indices)
             logger.info(f"Filtered to language={language}: {len(self.ds)} samples")
@@ -67,50 +105,35 @@ class IWSLTEvalDataset(Dataset):
     def __getitem__(self, idx) -> Dict:
         item = self.ds[idx]
         
-        # Extract audio arrays
-        ref_audio = self._process_audio(item["ref_audio"])
-        best_audio = self._process_audio(item["best_audio"])
+        # Manually decode audio using soundfile
+        ref_array, ref_sr = _decode_audio_bytes(item["ref_audio"])
+        best_array, best_sr = _decode_audio_bytes(item["best_audio"])
+        
+        # Resample to target SR
+        ref_array = _resample(ref_array, ref_sr, self.target_sr)
+        best_array = _resample(best_array, best_sr, self.target_sr)
         
         return {
             "id": item["id"],
             "language": item["language"],
             "text": item["text"],
-            "ref_audio": ref_audio["array"],
-            "ref_sr": ref_audio["sr"],
-            "best_audio": best_audio["array"],
-            "best_sr": best_audio["sr"],
+            "ref_audio": ref_array,
+            "ref_sr": self.target_sr,
+            "best_audio": best_array,
+            "best_sr": self.target_sr,
             "best_model": item["best_model"],
             "best_score": item["best_score"],
         }
-    
-    def _process_audio(self, audio_field: Dict) -> Dict:
-        """Process an audio field from the HF dataset."""
-        array = np.array(audio_field["array"], dtype=np.float32)
-        sr = audio_field["sampling_rate"]
-        
-        # Resample if needed
-        if sr != self.target_sr:
-            array = self._resample(array, sr, self.target_sr)
-            sr = self.target_sr
-        
-        return {"array": array, "sr": sr}
-    
-    def _resample(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """Resample audio to target sample rate."""
-        waveform = torch.from_numpy(audio).unsqueeze(0)
-        resampler = torchaudio.transforms.Resample(orig_sr, target_sr)
-        resampled = resampler(waveform).squeeze(0).numpy()
-        return resampled
 
 
 class MultiSpeakerTrainDataset(Dataset):
     """
-    Multi-speaker training dataset for LoRA fine-tuning.
+    Multi-speaker training dataset.
     
     Can load from:
-    - Local directory with audio files organized by speaker
-    - HuggingFace dataset (e.g., mozilla-foundation/common_voice_17_0)
-    - The IWSLT eval dataset itself (for quick experiments)
+    - IWSLT eval dataset (for quick experiments)
+    - Any HuggingFace dataset with audio + text columns
+    - Local directory of audio files
     """
     
     def __init__(
@@ -143,13 +166,19 @@ class MultiSpeakerTrainDataset(Dataset):
         is_train: bool,
     ):
         """Use the IWSLT eval dataset as training data (for quick experiments)."""
-        from datasets import load_dataset
+        from datasets import load_dataset, Audio
         
         logger.info("Loading IWSLT dataset as training data...")
         ds = load_dataset(
             "amanuelbyte/omnivoice-best-of-n-dev-eval",
             split="train",
         )
+        
+        # Disable auto audio decoding
+        audio_columns = [c for c in ds.column_names
+                        if isinstance(ds.features[c], Audio)]
+        for col in audio_columns:
+            ds = ds.cast_column(col, Audio(decode=False))
         
         if language:
             lang_column = ds["language"]
@@ -170,19 +199,21 @@ class MultiSpeakerTrainDataset(Dataset):
         
         self.samples = []
         for item in ds:
-            ref = item["ref_audio"]
-            audio = np.array(ref["array"], dtype=np.float32)
-            sr = ref["sampling_rate"]
-            duration = len(audio) / sr
-            
-            if self.min_duration <= duration <= self.max_duration:
-                self.samples.append({
-                    "audio": audio,
-                    "sr": sr,
-                    "text": item["text"],
-                    "speaker_id": item["id"][:5],  # Use prefix as pseudo speaker ID
-                    "language": item["language"],
-                })
+            try:
+                audio, sr = _decode_audio_bytes(item["ref_audio"])
+                duration = len(audio) / sr
+                
+                if self.min_duration <= duration <= self.max_duration:
+                    self.samples.append({
+                        "audio": audio,
+                        "sr": sr,
+                        "text": item["text"],
+                        "speaker_id": item["id"][:5],  # Use prefix as pseudo speaker ID
+                        "language": item["language"],
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to decode audio sample: {e}")
+                continue
         
         logger.info(f"IWSLT training data: {len(self.samples)} samples")
     
@@ -195,7 +226,7 @@ class MultiSpeakerTrainDataset(Dataset):
         is_train: bool,
     ):
         """Load from a HuggingFace dataset."""
-        from datasets import load_dataset
+        from datasets import load_dataset, Audio
         
         logger.info(f"Loading HF dataset: {dataset_name} ({language})...")
         
@@ -208,6 +239,12 @@ class MultiSpeakerTrainDataset(Dataset):
                 lang_column = ds[lang_col]
                 indices = [i for i, l in enumerate(lang_column) if l == language]
                 ds = ds.select(indices)
+        
+        # Disable auto audio decoding for all audio columns
+        audio_columns = [c for c in ds.column_names
+                        if isinstance(ds.features[c], Audio)]
+        for col in audio_columns:
+            ds = ds.cast_column(col, Audio(decode=False))
         
         n_total = len(ds)
         n_train = int(n_total * train_split)
@@ -222,7 +259,10 @@ class MultiSpeakerTrainDataset(Dataset):
         
         self.samples = []
         # Determine column names
-        audio_col = "audio" if "audio" in ds.column_names else "path"
+        audio_col = next(
+            (c for c in ["audio", "ref_audio"] if c in ds.column_names),
+            "audio"
+        )
         text_col = next(
             (c for c in ["sentence", "text", "transcription"] if c in ds.column_names),
             "text"
@@ -234,11 +274,7 @@ class MultiSpeakerTrainDataset(Dataset):
         
         for item in ds:
             try:
-                if isinstance(item[audio_col], dict):
-                    audio = np.array(item[audio_col]["array"], dtype=np.float32)
-                    sr = item[audio_col]["sampling_rate"]
-                else:
-                    continue
+                audio, sr = _decode_audio_bytes(item[audio_col])
                 
                 duration = len(audio) / sr
                 if not (self.min_duration <= duration <= self.max_duration):
@@ -258,8 +294,6 @@ class MultiSpeakerTrainDataset(Dataset):
     
     def _load_from_local(self, directory: str, max_samples: Optional[int]):
         """Load from a local directory of audio files."""
-        import soundfile as sf
-        
         audio_dir = Path(directory)
         self.samples = []
         
@@ -300,10 +334,7 @@ class MultiSpeakerTrainDataset(Dataset):
         sr = sample["sr"]
         
         # Resample if needed
-        if sr != self.target_sr:
-            waveform = torch.from_numpy(audio).unsqueeze(0)
-            resampler = torchaudio.transforms.Resample(sr, self.target_sr)
-            audio = resampler(waveform).squeeze(0).numpy()
+        audio = _resample(audio, sr, self.target_sr)
         
         return {
             "audio": audio,
