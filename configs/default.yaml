@@ -1,0 +1,90 @@
+# ============================================================
+# Retrofit: Efficient Voice Cloning via Parameter-Efficient Adaptation
+# Default Configuration
+# ============================================================
+
+# ----- Model -----
+model:
+  name: "F5-TTS"                    # Base TTS model
+  ckpt_file: null                   # Path to custom checkpoint (null = use default)
+  vocab_file: null                  # Path to custom vocab (null = use default)
+  device: "cuda"
+
+# ----- LoRA Configuration -----
+lora:
+  enabled: true
+  rank: 8                           # LoRA rank (lower = fewer params, faster)
+  alpha: 16                         # LoRA scaling factor
+  dropout: 0.05                     # LoRA dropout
+  target_modules:                   # Which module names to target (substring match)
+    - "to_q"                        # Query projections
+    - "to_k"                        # Key projections
+    - "to_v"                        # Value projections
+    - "to_out"                      # Output projections
+  target_layers: null               # Which layer indices to target (null = all layers)
+                                    # Set to a list like [0, 1, 2, 3] for targeted LoRA
+
+# ----- Training -----
+training:
+  epochs: 50
+  batch_size: 4                     # Per GPU
+  gradient_accumulation_steps: 4    # Effective batch = batch_size * grad_accum * n_gpus
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_grad_norm: 1.0
+  save_every_n_epochs: 5
+  eval_every_n_epochs: 5
+  log_every_n_steps: 10
+  seed: 42
+  fp16: true                        # Mixed precision training
+  num_workers: 4
+
+# ----- Data -----
+data:
+  # Training data: multi-speaker audio dataset
+  train_dataset: "mozilla-foundation/common_voice_17_0"
+  train_language: "fr"              # Language subset for training
+  train_split: "train"
+  max_train_samples: 5000           # Limit for fast experiments
+  min_audio_duration: 1.0           # Minimum audio length in seconds
+  max_audio_duration: 15.0          # Maximum audio length in seconds
+  
+  # Evaluation data: IWSLT benchmark
+  eval_dataset: "amanuelbyte/omnivoice-best-of-n-dev-eval"
+  eval_split: "train"              # The dataset only has a train split
+  eval_languages:                  # Languages to evaluate
+    - "fr"
+    - "ar"
+    - "zh"
+
+# ----- Audio Processing -----
+audio:
+  sample_rate: 24000               # F5-TTS default sample rate
+  n_mel_channels: 100              # Number of mel channels
+  hop_length: 256
+  win_length: 1024
+  n_fft: 1024
+
+# ----- Speaker Encoder -----
+speaker_encoder:
+  model: "speechbrain/spkrec-ecapa-voxceleb"
+  embedding_dim: 192
+
+# ----- ASR (for CER computation) -----
+asr:
+  model: "large-v3"                # Whisper model size
+  device: "cuda"
+  compute_type: "float16"
+
+# ----- Experiment -----
+experiment:
+  name: "retrofit_baseline"
+  output_dir: "./experiments"
+  wandb_project: "retrofit-voice-cloning"
+  wandb_enabled: false             # Set to true to enable W&B logging
+
+# ----- Distributed Training -----
+distributed:
+  backend: "nccl"
+  world_size: 2                    # Number of GPUs (2x A40)
