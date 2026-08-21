@@ -354,6 +354,14 @@ def train_model(
     logger.info(f"Total Parameters:     {total_params:,} ({total_params/1e6:.2f}M) [Target Error: {param_error:+.2%}]")
     logger.info(f"Trainable Parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
 
+    # Enable torch.compile for non-fused SSM architectures on CUDA
+    if hasattr(torch, "compile") and device.type == "cuda" and arch in {"mamba", "hybrid"}:
+        try:
+            logger.info("Enabling torch.compile on SSM architecture for fused CUDA kernel acceleration...")
+            model = torch.compile(model)
+        except Exception as e:
+            logger.warning(f"torch.compile skipped: {e}")
+
     # 2. Resolve Datasets & Loaders
     train_file = train_data or find_data_file(data_dir, ["train.bin", "train_tokens.npy"])
     val_file = val_data or find_data_file(data_dir, ["val.bin", "val_tokens.npy"])
