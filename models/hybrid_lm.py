@@ -113,6 +113,8 @@ class HybridMambaTransformerLM(nn.Module):
         mamba_backend: str = "auto",
     ):
         super().__init__()
+        if vocab_size <= 0:
+            raise ValueError(f"vocab_size must be positive, got {vocab_size}")
         if n_layers <= 0:
             raise ValueError(f"n_layers must be positive, got {n_layers}")
         if attn_every <= 0:
@@ -123,6 +125,13 @@ class HybridMambaTransformerLM(nn.Module):
             raise ValueError(f"n_heads ({n_heads}) must be even for GQA num_key_value_heads=n_heads//2")
         if d_ff <= 0:
             raise ValueError(f"d_ff must be positive, got {d_ff}")
+        if mamba_backend not in {"auto", "official", "torch"}:
+            raise ValueError(f"mamba_backend must be 'auto', 'official', or 'torch', got {mamba_backend!r}")
+
+        head_dim = d_model // n_heads
+        rotary_dim = int(head_dim * partial_rotary_factor)
+        if rotary_dim <= 0 or rotary_dim % 2 != 0:
+            raise ValueError(f"Partial RoPE dimension must be positive and even, got {rotary_dim}")
 
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -322,8 +331,17 @@ def choose_near_target_hybrid_config(vocab_size: int, target_params: int = 50_00
         for n_layers in range(12, 24, 3):
             params = estimate_hybrid_parameters(vocab_size, d_model, n_layers, n_heads, d_ff)
             diff = abs(params - target_params)
-            candidates.append((diff, params, {"d_model": d_model, "n_layers": n_layers, "n_heads": n_heads, "d_ff": d_ff}))
-    return min(candidates, key=lambda x: x[0])[2]
+            candidates.append((
+                diff,
+                {
+                    "d_model": d_model,
+                    "n_layers": n_layers,
+                    "n_heads": n_heads,
+                    "d_ff": d_ff,
+                    "estimated_params": params,
+                },
+            ))
+    return min(candidates, key=lambda x: x[0])[1]
 
 
 def create_hybrid(vocab_size: int = 3919, target_params: int = 50_000_000, mamba_backend: str = "auto") -> HybridMambaTransformerLM:
