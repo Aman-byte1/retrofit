@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -32,7 +33,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from models import create_model
-from data.dataset import MemmapDataset, InfiniteDataLoader
+from data.dataset import MemmapDataset
 
 
 logging.basicConfig(
@@ -286,10 +287,23 @@ def evaluate(
     }
 
 
+def find_data_file(path_or_dir: str, default_names: list) -> str:
+    """Resolve file path from either direct file path or parent directory."""
+    if os.path.isfile(path_or_dir):
+        return path_or_dir
+    for name in default_names:
+        candidate = os.path.join(path_or_dir, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(path_or_dir, default_names[0])
+
+
 def train_model(
     arch: str,
-    data_dir: str,
-    output_dir: str,
+    data_dir: str = "data/tokenized",
+    train_data: Optional[str] = None,
+    val_data: Optional[str] = None,
+    output_dir: str = "results",
     vocab_size: int = 3919,
     target_params: int = 50_000_000,
     seq_len: int = 512,
@@ -310,12 +324,18 @@ def train_model(
     seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_dir = Path(output_dir) / f"{arch}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = Path(output_dir) / f"{arch}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Also maintain canonical arch directory for analysis
+    canonical_arch_dir = Path(output_dir) / arch
+    canonical_arch_dir.mkdir(parents=True, exist_ok=True)
+
     step_log_file = run_dir / "step_logs.jsonl"
 
     logger.info("=" * 80)
-    logger.info(f"STARTING TRAINING: {arch.upper()} on {device} (Device Name: {torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
+    logger.info(f"STARTING TRAINING: {arch.upper()} on {device} (Device: {torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
     logger.info(f"Target Parameters: {target_params:,} | Vocab Size: {vocab_size:,} | Batch: {batch_size} (accum={grad_accum})")
     logger.info("=" * 80)
 
@@ -334,18 +354,19 @@ def train_model(
     logger.info(f"Total Parameters:     {total_params:,} ({total_params/1e6:.2f}M) [Target Error: {param_error:+.2%}]")
     logger.info(f"Trainable Parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
 
-    # 2. Datasets & Loaders
-    train_bin = os.path.join(data_dir, "train.bin")
-    val_bin = os.path.join(data_dir, "val.bin")
+    # 2. Resolve Datasets & Loaders
+    train_file = train_data or find_data_file(data_dir, ["train.bin", "train_tokens.npy"])
+    val_file = val_data or find_data_file(data_dir, ["val.bin", "val_tokens.npy"])
 
-    if not os.path.exists(train_bin):
-        logger.warning(f"{train_bin} not found. Creating synthetic training tokens for verification...")
+    if not os.path.exists(train_file):
+        logger.warning(f"{train_file} not found. Creating synthetic training tokens for verification...")
         synthetic_tokens = np.random.randint(0, vocab_size, size=(200_000,), dtype=np.uint16)
-        synthetic_tokens.tofile(train_bin)
-        synthetic_tokens[:20_000].tofile(val_bin)
+        os.makedirs(os.path.dirname(train_file) or ".", exist_ok=True)
+        synthetic_tokens.tofile(train_file)
+        synthetic_tokens[:20_000].tofile(val_file)
 
-    train_ds = MemmapDataset(train_bin, seq_len=seq_len)
-    val_ds = MemmapDataset(val_bin, seq_len=seq_len)
+    train_ds = MemmapDataset(train_file, seq_len=seq_len)
+    val_ds = MemmapDataset(val_file, seq_len=seq_len)
 
     train_dl = DataLoader(
         train_ds,
@@ -363,8 +384,8 @@ def train_model(
         pin_memory=(device.type == "cuda"),
     )
 
-    logger.info(f"Train Dataset: {len(train_ds):,} sequences ({len(train_ds) * seq_len:,} tokens)")
-    logger.info(f"Val Dataset:   {len(val_ds):,} sequences ({len(val_ds) * seq_len:,} tokens)")
+    logger.info(f"Train Dataset: {len(train_ds):,} sequences ({len(train_ds) * seq_len:,} tokens) from {train_file}")
+    logger.info(f"Val Dataset:   {len(val_ds):,} sequences ({len(val_ds) * seq_len:,} tokens) from {val_file}")
 
     # 3. Optimizer with parameter-grouping respecting _no_weight_decay
     decay_params = []
@@ -395,14 +416,14 @@ def train_model(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Mixed Precision Setup (independent of GradScaler)
+    # Mixed Precision Setup
     amp_enabled = (device.type == "cuda")
     amp_dtype = torch.bfloat16
-    scaler = None  # bfloat16 does not require gradient scaling
+    scaler = None
 
     epoch_logs = []
     val_history = []
-    initial_weights = get_weight_statistics(model)
+    best_val_ppl = float("inf")
 
     # Initial Zero-Shot Validation Check
     initial_eval = evaluate(model, val_dl, device, amp_enabled=amp_enabled, amp_dtype=amp_dtype, hrm_mode=hrm_mode)
@@ -442,19 +463,20 @@ def train_model(
 
         epoch_result.update(eval_result)
         epoch_logs.append(epoch_result)
-        val_history.append(eval_result["perplexity"])
+        current_ppl = eval_result["perplexity"]
+        val_history.append(current_ppl)
 
         logger.info(
             f"Epoch {epoch + 1} Complete | "
             f"Train Base Loss: {epoch_result['avg_base_loss']:.4f} | "
             f"Val Loss: {eval_result['val_loss']:.4f} | "
-            f"Val PPL: {eval_result['perplexity']:.2f} | "
+            f"Val PPL: {current_ppl:.2f} | "
             f"Epoch Speed: {epoch_result['avg_tokens_per_sec']:,.0f} tok/s"
         )
 
-        # Comprehensive, fully-resumable checkpoint
+        # Resumable Checkpoint
         checkpoint = {
-            "epoch": epoch,
+            "epoch": epoch + 1,
             "global_step": (epoch + 1) * len(train_dl),
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
@@ -463,15 +485,21 @@ def train_model(
             "arch": arch,
             "vocab_size": vocab_size,
             "val_loss": eval_result["val_loss"],
-            "perplexity": eval_result["perplexity"],
+            "perplexity": current_ppl,
             "model_config": model_kwargs,
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
-        torch.save(checkpoint, run_dir / f"checkpoint_epoch_{epoch + 1}.pt")
+        
+        ckpt_path = run_dir / f"checkpoint_epoch_{epoch + 1}.pt"
+        torch.save(checkpoint, ckpt_path)
+
+        if current_ppl < best_val_ppl:
+            best_val_ppl = current_ppl
+            torch.save(checkpoint, run_dir / "best_model.pt")
+            torch.save(checkpoint, canonical_arch_dir / "best_model.pt")
 
     total_wall_clock = time.time() - start_wall_clock
-    final_weights = get_weight_statistics(model)
 
     summary = {
         "arch": arch,
@@ -497,8 +525,12 @@ def train_model(
         "completed_at": datetime.now().isoformat(),
     }
 
-    with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    # Save summary and results to both run_dir and canonical_arch_dir
+    for target_dir in [run_dir, canonical_arch_dir]:
+        with open(target_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        with open(target_dir / "results.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
 
     logger.info("\n" + "=" * 80)
     logger.info(f"TRAINING COMPLETE: {arch.upper()}")
@@ -512,6 +544,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train 50M-Class Amharic Language Model Architectures")
     parser.add_argument("--arch", type=str, required=True, choices=["transformer", "hrm", "mamba", "hybrid"], help="Architecture to train")
     parser.add_argument("--data-dir", type=str, default="data/tokenized", help="Path to tokenized binary datasets")
+    parser.add_argument("--train-data", type=str, default=None, help="Direct path to train tokens (.bin or .npy)")
+    parser.add_argument("--val-data", type=str, default=None, help="Direct path to val tokens (.bin or .npy)")
     parser.add_argument("--output-dir", type=str, default="results", help="Directory to save checkpoints and metrics")
     parser.add_argument("--vocab-size", type=int, default=3919, help="Vocabulary size")
     parser.add_argument("--target-params", type=int, default=50_000_000, help="Target parameter count (~50M)")
@@ -534,6 +568,8 @@ def main():
     train_model(
         arch=args.arch,
         data_dir=args.data_dir,
+        train_data=args.train_data,
+        val_data=args.val_data,
         output_dir=args.output_dir,
         vocab_size=args.vocab_size,
         target_params=args.target_params,

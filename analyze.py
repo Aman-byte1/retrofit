@@ -47,31 +47,51 @@ ARCH_MARKERS = {
 
 
 def load_results(results_dir: str) -> Dict[str, Any]:
-    """Load all results from each architecture subdirectory."""
+    """Load all results from each architecture subdirectory (canonical or timestamped)."""
     all_results = {}
     
     for arch in ["transformer", "hrm", "mamba", "hybrid"]:
-        arch_dir = os.path.join(results_dir, arch)
-        
-        results_path = os.path.join(arch_dir, "results.json")
-        benchmark_path = os.path.join(arch_dir, "benchmark.json")
-        steps_path = os.path.join(arch_dir, "step_logs.json")
+        candidate_dirs = [os.path.join(results_dir, arch)]
+        if os.path.exists(results_dir):
+            for d in sorted(os.listdir(results_dir)):
+                if d.startswith(f"{arch}_") and os.path.isdir(os.path.join(results_dir, d)):
+                    candidate_dirs.append(os.path.join(results_dir, d))
         
         arch_data = {"arch": arch}
         
-        if os.path.exists(results_path):
-            with open(results_path) as f:
-                arch_data["training"] = json.load(f)
+        for arch_dir in candidate_dirs:
+            if not os.path.exists(arch_dir):
+                continue
+            
+            # Training summary
+            for fname in ["summary.json", "results.json"]:
+                fpath = os.path.join(arch_dir, fname)
+                if os.path.exists(fpath) and "training" not in arch_data:
+                    with open(fpath, encoding="utf-8") as f:
+                        arch_data["training"] = json.load(f)
+            
+            # Benchmark results
+            bpath = os.path.join(arch_dir, "benchmark.json")
+            if os.path.exists(bpath) and "benchmark" not in arch_data:
+                with open(bpath, encoding="utf-8") as f:
+                    arch_data["benchmark"] = json.load(f)
+            
+            # Step logs (.json or .jsonl)
+            if "step_logs" not in arch_data:
+                jsonl_path = os.path.join(arch_dir, "step_logs.jsonl")
+                json_path = os.path.join(arch_dir, "step_logs.json")
+                if os.path.exists(jsonl_path):
+                    logs = []
+                    with open(jsonl_path, encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip():
+                                logs.append(json.loads(line))
+                    arch_data["step_logs"] = logs
+                elif os.path.exists(json_path):
+                    with open(json_path, encoding="utf-8") as f:
+                        arch_data["step_logs"] = json.load(f)
         
-        if os.path.exists(benchmark_path):
-            with open(benchmark_path) as f:
-                arch_data["benchmark"] = json.load(f)
-        
-        if os.path.exists(steps_path):
-            with open(steps_path) as f:
-                arch_data["step_logs"] = json.load(f)
-        
-        if len(arch_data) > 1:  # Has data beyond just "arch"
+        if len(arch_data) > 1:
             all_results[arch] = arch_data
     
     logger.info(f"Loaded results for: {list(all_results.keys())}")

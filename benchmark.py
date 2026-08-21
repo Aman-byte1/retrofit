@@ -293,12 +293,16 @@ def main():
     
     model = create_model(args.arch, args.vocab_size)
     
-    if args.checkpoint:
-        state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-        if "model_state_dict" in state_dict:
-            state_dict = state_dict["model_state_dict"]
-        model.load_state_dict(state_dict)
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        for key in ("model_state", "model", "model_state_dict"):
+            if isinstance(state_dict, dict) and key in state_dict:
+                state_dict = state_dict[key]
+                break
+        model.load_state_dict(state_dict, strict=False)
         logger.info(f"Loaded checkpoint from {args.checkpoint}")
+    elif args.checkpoint:
+        logger.warning(f"Checkpoint {args.checkpoint} not found; running benchmark on initialized architecture.")
     
     out_dir = os.path.join(args.output_dir, args.arch)
     benchmark_model(args.arch, model, args.vocab_size, out_dir, args.seq_lengths)
