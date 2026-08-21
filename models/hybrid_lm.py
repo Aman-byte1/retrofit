@@ -41,7 +41,8 @@ class HybridAttentionLayer(nn.Module):
         self.attn = Qwen3Attention(
             hidden_size=d_model,
             num_attention_heads=n_heads,
-            max_position_embeddings=max_seq_len,
+            num_key_value_heads=n_heads // 2,
+            head_dim=d_model // n_heads,
         )
         self.ffn_norm = QwenRMSNorm(d_model)
         self.ffn = Qwen3MLP(d_model, d_ff)
