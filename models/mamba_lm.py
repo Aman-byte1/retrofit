@@ -9,11 +9,12 @@ Features:
   • Official `mamba_ssm` backend with high-performance CUDA fused selective scan
   • Mathematically faithful pure-PyTorch fallback with exact dt_rank = ceil(d_model / 16)
   • Specialized Mamba initialization (dt_proj log-spaced inverse softplus, S4D A_log)
-  • Output projection depth-scaling (1 / sqrt(n_layers)) supporting both backends
+  • Idempotent output projection depth-scaling (1 / sqrt(n_layers)) for both backends
   • Protection of A_log and D parameters from weight decay (_no_weight_decay = True)
+  • Safety against reinitialization (_no_reinit = True on dt_proj.bias)
   • Self-contained RMSNorm (eps=1e-5)
   • Robust loss calculation and analytical parameter estimation
-  • Dynamic near-target configuration search (~50M parameters across any vocab)
+  • Dynamic near-target configuration search (~50M parameters)
 """
 
 import math
@@ -64,6 +65,12 @@ class MambaBlock(nn.Module):
         super().__init__()
         if backend not in {"auto", "official", "torch"}:
             raise ValueError(f"backend must be 'auto', 'official', or 'torch', got {backend!r}")
+        if d_model <= 0 or d_state <= 0 or d_conv <= 0 or expand <= 0:
+            raise ValueError("Mamba dimensions (d_model, d_state, d_conv, expand) must all be positive")
+        if not (0 < dt_min <= dt_max):
+            raise ValueError(f"Require 0 < dt_min <= dt_max, got dt_min={dt_min}, dt_max={dt_max}")
+        if dt_init_floor <= 0:
+            raise ValueError(f"dt_init_floor must be positive, got {dt_init_floor}")
 
         self.d_model = d_model
         self.d_state = d_state
@@ -126,6 +133,7 @@ class MambaBlock(nn.Module):
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
 
         # S4D diagonal state matrix A (log-parameterized: A = -exp(A_log))
         A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
@@ -257,7 +265,7 @@ class MambaLM(nn.Module):
 
     def _init_weights(self):
         """
-        Initialize embedding properly and depth-scale output projections.
+        Initialize embedding properly and apply idempotent depth scaling to output projections.
         Preserves Mamba's specialized A_log and dt_proj initialization.
         """
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
@@ -265,9 +273,9 @@ class MambaLM(nn.Module):
         with torch.no_grad():
             for layer in self.layers:
                 block = layer.mamba
-                # Official backend stores the real mixer one level deeper
                 mixer = block.mamba if block._use_official else block
                 if hasattr(mixer, "out_proj") and hasattr(mixer.out_proj, "weight"):
+                    nn.init.kaiming_uniform_(mixer.out_proj.weight, a=math.sqrt(5))
                     mixer.out_proj.weight.div_(math.sqrt(self.n_layers))
 
     def forward(self, x: torch.Tensor, targets: Optional[torch.Tensor] = None):
